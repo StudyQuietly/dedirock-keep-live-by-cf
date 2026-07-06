@@ -1,6 +1,7 @@
 const CONFIG_KEY = "settings";
 const STATE_KEY = "monitor-state";
 const DEFAULT_VPS_CRON = "*/5 * * * *";
+const MAX_EVENT_LOGS = 100;
 
 const DEFAULT_SETTINGS = {
   checkIntervalNote: "Worker wakes up every minute; each VPS controls its own cron schedule.",
@@ -43,6 +44,12 @@ export default {
 
       if (url.pathname === "/api/state" && request.method === "GET") {
         return jsonResponse(await getState(env));
+      }
+
+      if (url.pathname === "/api/logs/clear" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const state = await clearLogs(env, body.scope || "recent");
+        return jsonResponse(state);
       }
 
       if (url.pathname === "/api/panels/test" && request.method === "POST") {
@@ -133,6 +140,7 @@ async function runMonitor(env, options = {}) {
       }
 
       state.vps[key] = result;
+      appendMonitorEvent(state, result);
       syncConfiguredVpsStatus(vps, result);
       settingsChanged = true;
       checks.push(result);
@@ -294,7 +302,28 @@ async function getSettings(env) {
 }
 
 async function getState(env) {
-  return getJson(env, STATE_KEY, { lastRunAt: null, vps: {} });
+  const state = await getJson(env, STATE_KEY, { lastRunAt: null, vps: {}, events: [], importantEvents: [] });
+  return {
+    lastRunAt: state.lastRunAt || null,
+    vps: state.vps || {},
+    events: Array.isArray(state.events) ? state.events : [],
+    importantEvents: Array.isArray(state.importantEvents) ? state.importantEvents : []
+  };
+}
+
+async function clearLogs(env, scope) {
+  const state = await getState(env);
+  if (scope === "recent" || scope === "all") {
+    state.events = [];
+  }
+  if (scope === "important" || scope === "all") {
+    state.importantEvents = [];
+  }
+  if (!["recent", "important", "all"].includes(scope)) {
+    throw new Error("Invalid log clear scope");
+  }
+  await putJson(env, STATE_KEY, state);
+  return state;
 }
 
 async function getJson(env, key, fallback) {
@@ -378,6 +407,34 @@ function syncConfiguredVpsStatus(vps, result) {
 
   vps.lastCheckedAt = result.checkedAt;
   vps.failureCount = result.failureCount || 0;
+}
+
+function appendMonitorEvent(state, result) {
+  const type = result.started ? "start" : result.error ? "error" : result.online ? "online" : "offline";
+  const level = result.error ? "error" : result.started || !result.online ? "warn" : "info";
+  const important = result.started || Boolean(result.error);
+  const event = {
+    id: crypto.randomUUID(),
+    type,
+    level,
+    important,
+    at: result.checkedAt,
+    panelId: result.panelId,
+    panelName: result.panelName,
+    vpsId: result.vpsId,
+    name: result.name,
+    online: result.online,
+    status: Number.isFinite(result.status) ? result.status : null,
+    failureCount: result.failureCount || 0,
+    started: Boolean(result.started),
+    error: result.error || null,
+    startResult: result.startResult || null
+  };
+
+  state.events = [event, ...(Array.isArray(state.events) ? state.events : [])].slice(0, MAX_EVENT_LOGS);
+  if (important) {
+    state.importantEvents = [event, ...(Array.isArray(state.importantEvents) ? state.importantEvents : [])];
+  }
 }
 
 function isCronDue(expression, date) {
@@ -776,6 +833,31 @@ const APP_HTML = `<!doctype html>
         </div>
         <div id="stateTable"></div>
       </section>
+      <section class="card stack">
+        <div class="between">
+          <h2>事件日志</h2>
+          <span class="muted">最多保留最近 100 条</span>
+        </div>
+        <div class="row">
+          <select id="eventLogType">
+            <option value="recent">最近日志</option>
+            <option value="important">重要日志</option>
+          </select>
+          <select id="eventLevelFilter">
+            <option value="all">全部等级</option>
+            <option value="info">Info</option>
+            <option value="warn">Warn</option>
+            <option value="error">Error</option>
+          </select>
+          <select id="eventVpsFilter">
+            <option value="all">全部 VPS</option>
+          </select>
+          <input id="eventSearch" style="max-width: 260px;" placeholder="搜索 VPS、名称、错误">
+          <button id="clearRecentLogsBtn">清除最近</button>
+          <button id="clearImportantLogsBtn" class="danger">清除重要</button>
+        </div>
+        <div id="eventTable"></div>
+      </section>
     </main>
   </div>
 
@@ -786,6 +868,11 @@ const APP_HTML = `<!doctype html>
     const panelList = document.querySelector("#panelList");
     const panelEditor = document.querySelector("#panelEditor");
     const stateTable = document.querySelector("#stateTable");
+    const eventTable = document.querySelector("#eventTable");
+    const eventLogType = document.querySelector("#eventLogType");
+    const eventLevelFilter = document.querySelector("#eventLevelFilter");
+    const eventVpsFilter = document.querySelector("#eventVpsFilter");
+    const eventSearch = document.querySelector("#eventSearch");
     const lastRunAt = document.querySelector("#lastRunAt");
     const defaultFailureThreshold = document.querySelector("#defaultFailureThreshold");
 
@@ -804,6 +891,12 @@ const APP_HTML = `<!doctype html>
     document.querySelector("#addPanelBtn").addEventListener("click", addPanel);
     document.querySelector("#refreshBtn").addEventListener("click", refreshVps);
     document.querySelector("#checkBtn").addEventListener("click", checkNow);
+    eventLogType.addEventListener("change", renderEvents);
+    eventLevelFilter.addEventListener("change", renderEvents);
+    eventVpsFilter.addEventListener("change", renderEvents);
+    eventSearch.addEventListener("input", renderEvents);
+    document.querySelector("#clearRecentLogsBtn").addEventListener("click", () => clearLogs("recent"));
+    document.querySelector("#clearImportantLogsBtn").addEventListener("click", () => clearLogs("important"));
 
     function authHeaders() {
       return {
@@ -884,6 +977,19 @@ const APP_HTML = `<!doctype html>
       }
     }
 
+    async function clearLogs(scope) {
+      const text = scope === "important" ? "重要日志" : "最近日志";
+      if (!confirm("确认清除" + text + "？")) return;
+
+      try {
+        state = await api("/api/logs/clear", { method: "POST", body: JSON.stringify({ scope }) });
+        renderEvents();
+        setNotice(mainNotice, "已清除" + text + "。");
+      } catch (error) {
+        setNotice(mainNotice, error.message, true);
+      }
+    }
+
     function addPanel() {
       const panel = {
         id: crypto.randomUUID(),
@@ -910,6 +1016,8 @@ const APP_HTML = `<!doctype html>
       renderPanelList();
       renderPanelEditor();
       renderState();
+      renderEventFilters();
+      renderEvents();
     }
 
     function renderPanelList() {
@@ -1029,6 +1137,71 @@ const APP_HTML = `<!doctype html>
       \`;
     }
 
+    function renderEventFilters() {
+      const selected = eventVpsFilter.value || "all";
+      const options = ['<option value="all">全部 VPS</option>'];
+
+      for (const panel of settings.panels || []) {
+        for (const vps of panel.vps || []) {
+          const value = panel.id + ":" + vps.id;
+          const label = [vps.name || vps.hostname || vps.id, vps.id].filter(Boolean).join(" / ");
+          options.push('<option value="' + escapeAttr(value) + '">' + escapeHtml(label) + '</option>');
+        }
+      }
+
+      eventVpsFilter.innerHTML = options.join("");
+      eventVpsFilter.value = [...eventVpsFilter.options].some((option) => option.value === selected) ? selected : "all";
+    }
+
+    function renderEvents() {
+      const source = eventLogType.value === "important" ? state.importantEvents || [] : state.events || [];
+      const level = eventLevelFilter.value;
+      const vpsKey = eventVpsFilter.value;
+      const keyword = eventSearch.value.trim().toLowerCase();
+      const rows = source.filter((row) => {
+        if (level !== "all" && row.level !== level) return false;
+        if (vpsKey !== "all" && (row.panelId + ":" + row.vpsId) !== vpsKey) return false;
+        if (!keyword) return true;
+
+        return [
+          row.panelName,
+          row.panelId,
+          row.vpsId,
+          row.name,
+          row.type,
+          row.level,
+          row.error,
+          summarizeStartResult(row.startResult)
+        ].some((value) => String(value || "").toLowerCase().includes(keyword));
+      });
+
+      if (!rows.length) {
+        eventTable.innerHTML = '<div class="empty">暂无事件日志。</div>';
+        return;
+      }
+
+      eventTable.innerHTML = \`
+        <table class="table">
+          <thead><tr><th>时间</th><th>等级</th><th>类型</th><th>面板</th><th>VPS</th><th>状态</th><th>失败次数</th><th>启动结果</th><th>错误</th></tr></thead>
+          <tbody>
+            \${rows.map((row) => \`
+              <tr>
+                <td>\${escapeHtml(row.at || "-")}</td>
+                <td>\${levelBadge(row.level)}</td>
+                <td>\${eventBadge(row)}</td>
+                <td>\${escapeHtml(row.panelName || row.panelId)}</td>
+                <td>\${escapeHtml(row.name || row.vpsId)}</td>
+                <td>\${row.online ? '<span class="badge ok">Online</span>' : '<span class="badge down">Offline</span>'}</td>
+                <td>\${row.failureCount || 0}</td>
+                <td>\${escapeHtml(summarizeStartResult(row.startResult))}</td>
+                <td>\${escapeHtml(row.error || "-")}</td>
+              </tr>
+            \`).join("")}
+          </tbody>
+        </table>
+      \`;
+    }
+
     function collectPanelForm() {
       const panel = settings.panels.find((item) => item.id === selectedPanelId);
       if (!panel || !document.querySelector("#panelName")) return;
@@ -1057,6 +1230,27 @@ const APP_HTML = `<!doctype html>
       if (Number(status) === 1) return '<span class="badge ok">Online</span>';
       if (Number(status) === 0) return '<span class="badge down">Offline</span>';
       return '<span class="badge">Unknown</span>';
+    }
+
+    function eventBadge(row) {
+      if (row.started) return '<span class="badge warn">Start</span>';
+      if (row.error) return '<span class="badge down">Error</span>';
+      if (row.online) return '<span class="badge ok">Online</span>';
+      return '<span class="badge down">Offline</span>';
+    }
+
+    function levelBadge(level) {
+      if (level === "error") return '<span class="badge down">Error</span>';
+      if (level === "warn") return '<span class="badge warn">Warn</span>';
+      return '<span class="badge ok">Info</span>';
+    }
+
+    function summarizeStartResult(value) {
+      if (!value) return "-";
+      if (value.done?.msg) return value.done.msg;
+      if (value.done_msg) return value.done_msg;
+      if (value.title) return value.title;
+      return JSON.stringify(value).slice(0, 120);
     }
 
     function setNotice(target, message, isError = false) {

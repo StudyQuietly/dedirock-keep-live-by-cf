@@ -10,6 +10,8 @@ Cloudflare Workers 版 DediRock / Virtualizor VPS 保活工具。
 - Worker 每分钟唤醒一次，再按每台 VPS 的 cron 表达式判断是否检查。
 - VPS 离线次数达到阈值后调用 Virtualizor `act=start`。
 - 每次检查后同步更新配置页中的 VPS 状态、IP、失败次数和检查时间。
+- 保留最近 100 条检查/启动事件日志，启动和错误日志会进入重要日志并长期保留。
+- 支持按日志等级、VPS 名称或关键字筛选日志，并支持清除最近日志或重要日志。
 - 提供前端配置页面，使用 `ADMIN_TOKEN` 保护管理 API。
 
 ## 部署
