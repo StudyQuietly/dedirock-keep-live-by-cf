@@ -14,6 +14,34 @@ Cloudflare Workers 版 DediRock / Virtualizor VPS 保活工具。
 
 ## 部署
 
+### GitHub Actions 自动部署
+
+在 GitHub 仓库的 `Settings -> Secrets and variables -> Actions` 中添加 3 个 Secrets：
+
+```text
+CLOUDFLARE_API_TOKEN
+CLOUDFLARE_ACCOUNT_ID
+ADMIN_TOKEN
+```
+
+`CLOUDFLARE_API_TOKEN` 至少需要以下权限：
+
+```text
+Workers Scripts: Edit
+Workers KV Storage: Edit
+Account Settings: Read
+```
+
+推送到 `main` 后，Actions 会自动：
+
+1. 查询是否存在 `dedirock-keep-live-config` KV namespace。
+2. 不存在则通过 Cloudflare API 创建。
+3. 将 KV namespace id 写入 Actions 临时工作区的 `wrangler.toml`。
+4. 部署 Worker。
+5. 同步 `ADMIN_TOKEN` 到 Worker Secret。
+
+### 手动部署
+
 1. 创建 KV：
 
 ```bash

@@ -1,0 +1,94 @@
+name: Deploy Worker
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  KV_TITLE: dedirock-keep-live-config
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Ensure KV namespace
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::Missing secret: CLOUDFLARE_API_TOKEN"
+            exit 1
+          fi
+
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::Missing secret: CLOUDFLARE_ACCOUNT_ID"
+            exit 1
+          fi
+
+          list_response="$(curl -fsS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces?per_page=100")"
+
+          echo "${list_response}" | jq -e '.success == true' >/dev/null
+
+          kv_id="$(echo "${list_response}" \
+            | jq -r --arg title "${KV_TITLE}" '.result[] | select(.title == $title) | .id' \
+            | head -n 1)"
+
+          if [ -z "${kv_id}" ]; then
+            create_response="$(curl -fsS -X POST \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces" \
+              --data "{\"title\":\"${KV_TITLE}\"}")"
+
+            echo "${create_response}" | jq -e '.success == true' >/dev/null
+            kv_id="$(echo "${create_response}" | jq -r '.result.id')"
+          fi
+
+          if [ -z "${kv_id}" ] || [ "${kv_id}" = "null" ]; then
+            echo "::error::Unable to resolve Cloudflare KV namespace id"
+            exit 1
+          fi
+
+          sed -i "s/replace_with_your_kv_namespace_id/${kv_id}/g" wrangler.toml
+          echo "KV namespace: ${KV_TITLE}"
+
+      - name: Validate Worker syntax
+        run: node --check src/worker.js
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
+
+      - name: Sync ADMIN_TOKEN secret
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ADMIN_TOKEN:-}" ]; then
+            echo "::error::Missing secret: ADMIN_TOKEN"
+            exit 1
+          fi
+
+          printf "%s" "${ADMIN_TOKEN}" | npx --yes wrangler@4 secret put ADMIN_TOKEN
