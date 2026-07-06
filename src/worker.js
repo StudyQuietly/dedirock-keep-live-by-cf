@@ -678,9 +678,15 @@ const APP_HTML = `<!doctype html>
       --warn: #9a6500;
     }
     * { box-sizing: border-box; }
+    html {
+      max-width: 100%;
+      overflow-x: hidden;
+    }
     body {
       margin: 0;
       min-height: 100vh;
+      max-width: 100%;
+      overflow-x: hidden;
       background: var(--bg);
       color: var(--text);
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -728,15 +734,20 @@ const APP_HTML = `<!doctype html>
     }
     .shell {
       display: grid;
-      grid-template-columns: 270px 1fr;
+      grid-template-columns: 270px minmax(0, 1fr);
       min-height: 100vh;
+      max-width: 100%;
+      overflow-x: hidden;
     }
     aside {
+      min-width: 0;
       border-right: 1px solid var(--line);
       background: #fff;
       padding: 20px;
     }
     main {
+      min-width: 0;
+      overflow-x: hidden;
       padding: 24px;
     }
     h1 {
@@ -755,6 +766,7 @@ const APP_HTML = `<!doctype html>
     .stack {
       display: grid;
       gap: 16px;
+      min-width: 0;
     }
     .row {
       display: flex;
@@ -767,8 +779,11 @@ const APP_HTML = `<!doctype html>
       align-items: center;
       justify-content: space-between;
       gap: 12px;
+      min-width: 0;
+      flex-wrap: wrap;
     }
     .card {
+      min-width: 0;
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -778,6 +793,7 @@ const APP_HTML = `<!doctype html>
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 12px;
+      min-width: 0;
     }
     .panel-list {
       display: grid;
@@ -855,6 +871,215 @@ const APP_HTML = `<!doctype html>
       border-radius: 8px;
       background: #fff;
     }
+    .status-summary {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+      min-height: 64px;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .status-summary > div {
+      min-width: 0;
+    }
+    .status-summary strong {
+      font-size: 20px;
+      overflow-wrap: anywhere;
+    }
+    .status-icon {
+      position: relative;
+      flex: 0 0 auto;
+      width: 24px;
+      height: 24px;
+      border-radius: 999px;
+      background: var(--muted);
+    }
+    .status-icon::after {
+      content: "";
+      position: absolute;
+      left: 8px;
+      top: 5px;
+      width: 6px;
+      height: 11px;
+      border: solid #fff;
+      border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+    }
+    .status-summary.ok .status-icon {
+      background: var(--ok);
+    }
+    .status-summary.warn .status-icon {
+      background: var(--warn);
+    }
+    .status-summary.warn .status-icon::after {
+      left: 11px;
+      top: 5px;
+      width: 2px;
+      height: 10px;
+      border: 0;
+      border-radius: 2px;
+      background: #fff;
+      transform: none;
+      box-shadow: 0 13px 0 #fff;
+    }
+    .status-summary.down .status-icon {
+      background: var(--danger);
+    }
+    .status-summary.down .status-icon::after {
+      left: 7px;
+      top: 11px;
+      width: 10px;
+      height: 2px;
+      border: 0;
+      border-radius: 2px;
+      background: #fff;
+      transform: none;
+    }
+    .status-groups {
+      display: grid;
+      gap: 14px;
+      min-width: 0;
+    }
+    .status-group-title {
+      margin: 8px 0;
+      font-size: 18px;
+      font-weight: 750;
+    }
+    .status-list {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+    .status-service {
+      display: grid;
+      grid-template-columns: minmax(0, 320px) minmax(0, 1fr);
+      gap: 16px;
+      align-items: center;
+      min-width: 0;
+      margin: 0 -10px;
+      padding: 12px 10px;
+      border-bottom: 1px solid var(--line);
+      border-radius: 8px;
+      transition: background .15s ease;
+    }
+    .status-service:hover {
+      background: #e8f7ef;
+    }
+    .status-service:last-child {
+      border-bottom: 0;
+    }
+    .status-service-name {
+      margin-bottom: 6px;
+      font-weight: 650;
+      overflow-wrap: anywhere;
+    }
+    .status-service > div {
+      min-width: 0;
+    }
+    .status-service-badges {
+      gap: 6px;
+    }
+    .status-bars {
+      display: grid;
+      grid-template-columns: repeat(48, minmax(2px, 1fr));
+      gap: 3px;
+      align-items: end;
+      width: 100%;
+      min-width: 0;
+    }
+    .status-segment {
+      position: relative;
+      height: 18px;
+      border-radius: 999px;
+      background: #d7dee9;
+      cursor: default;
+    }
+    .status-segment.ok {
+      background: #55d884;
+    }
+    .status-segment.down {
+      background: #e35b5b;
+    }
+    .status-segment.warn {
+      background: #e7a93b;
+    }
+    .status-segment:hover {
+      z-index: 11;
+    }
+    .status-tooltip {
+      position: absolute;
+      left: 50%;
+      bottom: calc(100% + 12px);
+      z-index: 10;
+      min-width: 168px;
+      max-width: min(220px, calc(100vw - 32px));
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: #172033;
+      color: #f8fafc;
+      text-align: center;
+      overflow-wrap: anywhere;
+      box-shadow: 0 12px 28px rgb(23 32 51 / 24%);
+      opacity: 0;
+      pointer-events: none;
+      transform: translate(-50%, 4px);
+      transition: opacity .12s ease, transform .12s ease;
+    }
+    .status-tooltip::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      bottom: -6px;
+      width: 12px;
+      height: 12px;
+      background: #172033;
+      transform: translateX(-50%) rotate(45deg);
+    }
+    .status-tooltip strong {
+      display: block;
+      margin-bottom: 6px;
+      color: #55d884;
+      font-size: 15px;
+    }
+    .status-tooltip.down strong {
+      color: #ff7878;
+    }
+    .status-tooltip.warn strong {
+      color: #ffd166;
+    }
+    .status-tooltip.unknown strong {
+      color: #cbd5e1;
+    }
+    .status-tooltip span {
+      display: block;
+      color: #f8fafc;
+    }
+    .status-segment:hover .status-tooltip {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
+    .status-history-label {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .status-history-label span {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .status-footer {
+      color: var(--muted);
+      text-align: center;
+      font-size: 12px;
+    }
     @media (max-width: 860px) {
       .shell {
         grid-template-columns: 1fr;
@@ -872,6 +1097,12 @@ const APP_HTML = `<!doctype html>
       .table {
         display: block;
         overflow-x: auto;
+      }
+      .status-service {
+        grid-template-columns: 1fr;
+      }
+      .status-summary {
+        align-items: flex-start;
       }
     }
   </style>
@@ -918,6 +1149,14 @@ const APP_HTML = `<!doctype html>
         <div class="notice" id="mainNotice"></div>
       </section>
 
+      <section class="card stack">
+        <div class="between">
+          <h2>状态总览</h2>
+          <span class="muted">仅管理页可见</span>
+        </div>
+        <div id="statusOverview"></div>
+      </section>
+
       <section class="card stack" id="panelEditor"></section>
       <section class="card stack">
         <div class="between">
@@ -960,6 +1199,7 @@ const APP_HTML = `<!doctype html>
     const mainNotice = document.querySelector("#mainNotice");
     const panelList = document.querySelector("#panelList");
     const panelEditor = document.querySelector("#panelEditor");
+    const statusOverview = document.querySelector("#statusOverview");
     const stateTable = document.querySelector("#stateTable");
     const eventTable = document.querySelector("#eventTable");
     const eventLogType = document.querySelector("#eventLogType");
@@ -1112,6 +1352,7 @@ const APP_HTML = `<!doctype html>
       defaultFailureThreshold.value = settings.defaultFailureThreshold || 2;
       renderPanelList();
       renderPanelEditor();
+      renderStatusOverview();
       renderState();
       renderEventFilters();
       renderEvents();
@@ -1205,6 +1446,201 @@ const APP_HTML = `<!doctype html>
       target.querySelectorAll("[data-start-vps]").forEach((button) => {
         button.addEventListener("click", () => startVps(panel.id, button.dataset.startVps));
       });
+    }
+
+    function renderStatusOverview() {
+      const groups = (settings.panels || [])
+        .map((panel) => ({
+          panel,
+          vps: (panel.vps || []).filter((vps) => vps.enabled)
+        }))
+        .filter((group) => group.vps.length);
+      const services = groups.flatMap((group) => group.vps.map((vps) => ({ panel: group.panel, vps })));
+
+      if (!services.length) {
+        statusOverview.innerHTML = '<div class="empty">暂无启用 VPS。</div>';
+        return;
+      }
+
+      const summary = summarizeStatusOverview(services);
+      statusOverview.innerHTML = \`
+        <div class="status-summary \${summary.level}">
+          <span class="status-icon" aria-hidden="true"></span>
+          <div>
+            <strong>\${escapeHtml(summary.title)}</strong>
+            <div class="muted">\${escapeHtml(summary.detail)}</div>
+          </div>
+        </div>
+        <div class="status-groups">
+          \${groups.map((group) => \`
+            <div class="status-group">
+              <div class="status-group-title">\${escapeHtml(group.panel.name || "Virtualizor Panel")}</div>
+              <div class="status-list">
+                \${group.vps.map((vps) => statusOverviewRow(group.panel, vps)).join("")}
+              </div>
+            </div>
+          \`).join("")}
+        </div>
+        <div class="status-footer">最后更新于 \${escapeHtml(state.lastRunAt || "-")}</div>
+      \`;
+    }
+
+    function statusOverviewRow(panel, vps) {
+      const key = panel.id + ":" + vps.id;
+      const row = (state.vps || {})[key];
+      const serviceStatus = getServiceStatus(row);
+      const availability = calculateAvailability(key, row);
+      const history = buildStatusHistory(key, row);
+      const name = vps.name || vps.hostname || vps.id;
+
+      return \`
+        <div class="status-service">
+          <div>
+            <div class="status-service-name">\${escapeHtml(name)}</div>
+            <div class="row status-service-badges">
+              <span class="badge \${serviceStatus.badgeClass}">\${escapeHtml(serviceStatus.label)}</span>
+              <span class="badge">\${escapeHtml(availability)}</span>
+            </div>
+          </div>
+          <div>
+            <div class="status-bars">
+              \${history.segments.map(statusSegmentHtml).join("")}
+            </div>
+            <div class="status-history-label">
+              <span>\${escapeHtml(history.startLabel)}</span>
+              <span>现在</span>
+            </div>
+          </div>
+        </div>
+      \`;
+    }
+
+    function summarizeStatusOverview(services) {
+      const counts = { ok: 0, warn: 0, down: 0, unknown: 0 };
+
+      for (const { panel, vps } of services) {
+        const key = panel.id + ":" + vps.id;
+        const status = getServiceStatus((state.vps || {})[key]);
+        counts[status.level] += 1;
+      }
+
+      const detail = services.length + " 台启用 VPS，在线 " + counts.ok + "，异常 " + counts.down + "，启动中 " + counts.warn + "，未检查 " + counts.unknown;
+      if (counts.down > 0) {
+        return { level: "down", title: "存在 VPS 离线或检查失败", detail };
+      }
+      if (counts.warn > 0) {
+        return { level: "warn", title: "存在 VPS 启动中或防重中", detail };
+      }
+      if (counts.unknown > 0) {
+        return { level: "warn", title: "部分 VPS 尚未检查", detail };
+      }
+      return { level: "ok", title: "所有启用 VPS 运行正常", detail };
+    }
+
+    function getServiceStatus(row) {
+      if (!row?.checkedAt) return { level: "unknown", label: "Unknown", badgeClass: "" };
+      if (row.error) return { level: "down", label: "Error", badgeClass: "down" };
+      if (row.online) return { level: "ok", label: "Online", badgeClass: "ok" };
+      if (row.started) return { level: "warn", label: "Starting", badgeClass: "warn" };
+      if (row.startSuppressed) return { level: "warn", label: "Cooldown", badgeClass: "warn" };
+      return { level: "down", label: "Offline", badgeClass: "down" };
+    }
+
+    function calculateAvailability(key, row) {
+      const samples = getStatusSamples(key, row).filter((sample) => sample.status !== "unknown");
+      if (!samples.length) return "暂无数据";
+
+      const ok = samples.filter((sample) => sample.status === "ok").length;
+      return Math.round((ok / samples.length) * 100) + "%";
+    }
+
+    function buildStatusHistory(key, row) {
+      const samples = getStatusSamples(key, row).reverse();
+      const padded = Array(Math.max(0, 48 - samples.length)).fill(null).map(() => unknownStatusSample()).concat(samples).slice(-48);
+      const firstKnown = padded.find((sample) => sample.at);
+      const startLabel = firstKnown?.at ? relativeTime(firstKnown.at) : "暂无";
+
+      return { segments: padded, startLabel };
+    }
+
+    function getStatusSamples(key, row) {
+      const samples = getStatusEvents(key).map(eventStatusSample);
+      if (!samples.length && row?.checkedAt) {
+        samples.push(rowStatusSample(row));
+      }
+      return samples;
+    }
+
+    function getStatusEvents(key) {
+      return (state.events || [])
+        .filter((event) => (event.panelId + ":" + event.vpsId) === key)
+        .slice(0, 48);
+    }
+
+    function eventStatusSample(event) {
+      if (event.error) return statusSample("down", "异常", event.at);
+      if (event.online) return statusSample("ok", "正常", event.at);
+      if (event.started) return statusSample("warn", "启动中", event.at);
+      if (event.startSuppressed) return statusSample("warn", "防重中", event.at);
+      return statusSample("down", "离线", event.at);
+    }
+
+    function rowStatusSample(row) {
+      if (row.error) return statusSample("down", "异常", row.checkedAt);
+      if (row.online) return statusSample("ok", "正常", row.checkedAt);
+      if (row.started) return statusSample("warn", "启动中", row.checkedAt);
+      if (row.startSuppressed) return statusSample("warn", "防重中", row.checkedAt);
+      return statusSample("down", "离线", row.checkedAt);
+    }
+
+    function statusSample(status, label, at) {
+      return { status, label, at: at || null };
+    }
+
+    function unknownStatusSample() {
+      return statusSample("unknown", "暂无数据", null);
+    }
+
+    function statusSegmentHtml(sample) {
+      return \`
+        <span class="status-segment \${sample.status}">
+          <span class="status-tooltip \${sample.status}">
+            <strong>\${escapeHtml(sample.label)}</strong>
+            <span>\${escapeHtml(sample.at ? formatDateTime(sample.at) : "暂无时间")}</span>
+          </span>
+        </span>
+      \`;
+    }
+
+    function relativeTime(value) {
+      const time = new Date(value).getTime();
+      if (!Number.isFinite(time)) return "-";
+
+      const diff = Math.max(0, Date.now() - time);
+      const minutes = Math.floor(diff / 60000);
+      if (minutes < 1) return "刚刚";
+      if (minutes < 60) return minutes + "m";
+
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return hours + "h";
+
+      return Math.floor(hours / 24) + "d";
+    }
+
+    function formatDateTime(value) {
+      const date = new Date(value);
+      if (!Number.isFinite(date.getTime())) return "-";
+
+      const pad = (number) => String(number).padStart(2, "0");
+      return [
+        date.getFullYear(),
+        pad(date.getMonth() + 1),
+        pad(date.getDate())
+      ].join("-") + " " + [
+        pad(date.getHours()),
+        pad(date.getMinutes()),
+        pad(date.getSeconds())
+      ].join(":");
     }
 
     function renderState() {
