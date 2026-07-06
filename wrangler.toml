@@ -1,9 +1,9 @@
 name = "dedirock-keep-live"
 main = "src/worker.js"
-compatibility_date = "2026-07-06"
+compatibility_date = "2026-05-03"
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/1 * * * *"]
 
 [[kv_namespaces]]
 binding = "CONFIG"

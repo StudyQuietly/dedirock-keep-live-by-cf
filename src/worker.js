@@ -1,8 +1,9 @@
 const CONFIG_KEY = "settings";
 const STATE_KEY = "monitor-state";
+const DEFAULT_VPS_CRON = "*/5 * * * *";
 
 const DEFAULT_SETTINGS = {
-  checkIntervalNote: "Cron is configured in wrangler.toml.",
+  checkIntervalNote: "Worker wakes up every minute; each VPS controls its own cron schedule.",
   defaultFailureThreshold: 2,
   panels: []
 };
@@ -57,7 +58,7 @@ export default {
       }
 
       if (url.pathname === "/api/check-now" && request.method === "POST") {
-        const result = await runMonitor(env);
+        const result = await runMonitor(env, { force: true });
         return jsonResponse(result);
       }
 
@@ -80,10 +81,12 @@ export default {
   }
 };
 
-async function runMonitor(env) {
+async function runMonitor(env, options = {}) {
   const settings = await getSettings(env);
   const state = await getState(env);
+  const now = new Date();
   const checks = [];
+  let settingsChanged = false;
 
   for (const panel of settings.panels.filter((item) => item.enabled)) {
     for (const vps of panel.vps.filter((item) => item.enabled)) {
@@ -94,7 +97,8 @@ async function runMonitor(env) {
         panelName: panel.name,
         vpsId: vps.id,
         name: vps.name,
-        checkedAt: new Date().toISOString(),
+        cron: vps.cron,
+        checkedAt: now.toISOString(),
         online: false,
         failureCount: previous.failureCount || 0,
         started: false,
@@ -102,10 +106,15 @@ async function runMonitor(env) {
       };
 
       try {
+        if (!options.force && !isCronDue(vps.cron, now)) {
+          continue;
+        }
+
         const info = await getVirtualizorVpsInfo(panel, vps.id);
         result.online = isVpsOnline(info);
         result.status = readVpsStatus(info);
         result.ip = readVpsIp(info);
+        result.hostname = readVpsHostname(info) || vps.hostname;
 
         if (result.online) {
           result.failureCount = 0;
@@ -124,12 +133,18 @@ async function runMonitor(env) {
       }
 
       state.vps[key] = result;
+      syncConfiguredVpsStatus(vps, result);
+      settingsChanged = true;
       checks.push(result);
     }
   }
 
-  state.lastRunAt = new Date().toISOString();
+  state.lastRunAt = now.toISOString();
   await putJson(env, STATE_KEY, state);
+  if (settingsChanged) {
+    await putJson(env, CONFIG_KEY, settings);
+  }
+
   return { ok: true, checked: checks.length, checks };
 }
 
@@ -147,7 +162,9 @@ async function refreshConfiguredVps(settings) {
       status: item.status,
       enabled: existing.get(String(item.id))?.enabled ?? true,
       autoStart: existing.get(String(item.id))?.autoStart ?? true,
-      failureThreshold: existing.get(String(item.id))?.failureThreshold || settings.defaultFailureThreshold || 2
+      cron: existing.get(String(item.id))?.cron || DEFAULT_VPS_CRON,
+      failureThreshold: existing.get(String(item.id))?.failureThreshold || settings.defaultFailureThreshold || 2,
+      lastCheckedAt: existing.get(String(item.id))?.lastCheckedAt || null
     }));
 
     panels.push({ ...panel, vps: merged });
@@ -158,7 +175,7 @@ async function refreshConfiguredVps(settings) {
 
 async function listVirtualizorVps(panel) {
   const data = await virtualizorRequest(panel, { act: "listvs" });
-  const entries = Object.entries(data).filter(([, value]) => value && typeof value === "object" && value.vpsid);
+  const entries = extractVirtualizorVpsEntries(data);
 
   return entries.map(([, item]) => ({
     id: String(item.vpsid),
@@ -167,6 +184,64 @@ async function listVirtualizorVps(panel) {
     ip: readIpFromVirtualizorList(item),
     status: Number(item.status)
   }));
+}
+
+function extractVirtualizorVpsEntries(data) {
+  const entries = [];
+  const seen = new Set();
+
+  if (data?.vs && typeof data.vs === "object") {
+    for (const [key, value] of Object.entries(data.vs)) {
+      if (isVirtualizorVpsObject(value, key)) {
+        const item = { ...value, vpsid: value.vpsid || key };
+        entries.push([String(item.vpsid), item]);
+      }
+    }
+  }
+
+  function visit(value, key = "") {
+    if (!value || typeof value !== "object") return;
+    if (seen.has(value)) return;
+    seen.add(value);
+
+    if (isVirtualizorVpsObject(value, key)) {
+      const item = { ...value, vpsid: value.vpsid || key };
+      entries.push([String(item.vpsid), item]);
+      return;
+    }
+
+    for (const [childKey, childValue] of Object.entries(value)) {
+      if (!childValue || typeof childValue !== "object") continue;
+      visit(childValue, childKey);
+    }
+  }
+
+  visit(data);
+
+  const deduped = new Map();
+  for (const [key, item] of entries) {
+    if (!deduped.has(key)) {
+      deduped.set(key, item);
+    }
+  }
+
+  return [...deduped.entries()];
+}
+
+function isVirtualizorVpsObject(value, key = "") {
+  if (!value || typeof value !== "object") return false;
+
+  const hasVpsId = Boolean(value.vpsid) || /^\d+$/.test(key);
+  const hasVpsShape = Boolean(
+    value.hostname ||
+    value.vps_name ||
+    value.uuid ||
+    value.virt ||
+    value.os_name ||
+    value.ips
+  );
+
+  return hasVpsId && hasVpsShape;
 }
 
 async function getVirtualizorVpsInfo(panel, vpsId) {
@@ -263,7 +338,11 @@ function normalizeVps(input) {
     status: input.status === undefined ? null : Number(input.status),
     enabled: Boolean(input.enabled ?? true),
     autoStart: Boolean(input.autoStart ?? true),
-    failureThreshold: positiveInteger(input.failureThreshold, 2)
+    cron: String(input.cron || DEFAULT_VPS_CRON).trim(),
+    failureThreshold: positiveInteger(input.failureThreshold, 2),
+    lastCheckedAt: input.lastCheckedAt || null,
+    lastOnline: input.lastOnline === undefined ? null : Boolean(input.lastOnline),
+    failureCount: Number(input.failureCount || 0)
   };
 }
 
@@ -289,6 +368,80 @@ function findConfiguredVps(settings, panelId, vpsId) {
   return { panel, vps };
 }
 
+function syncConfiguredVpsStatus(vps, result) {
+  if (!result.error) {
+    vps.status = Number.isFinite(result.status) ? result.status : null;
+    vps.ip = result.ip || vps.ip || "";
+    vps.hostname = result.hostname || vps.hostname || "";
+    vps.lastOnline = result.online;
+  }
+
+  vps.lastCheckedAt = result.checkedAt;
+  vps.failureCount = result.failureCount || 0;
+}
+
+function isCronDue(expression, date) {
+  const parts = String(expression || DEFAULT_VPS_CRON).trim().split(/\s+/);
+  if (parts.length !== 5) {
+    throw new Error(`Invalid cron expression: ${expression}`);
+  }
+
+  const values = [
+    date.getUTCMinutes(),
+    date.getUTCHours(),
+    date.getUTCDate(),
+    date.getUTCMonth() + 1,
+    date.getUTCDay()
+  ];
+  const ranges = [
+    [0, 59],
+    [0, 23],
+    [1, 31],
+    [1, 12],
+    [0, 7]
+  ];
+
+  return parts.every((part, index) => matchCronField(part, values[index], ranges[index][0], ranges[index][1], index === 4));
+}
+
+function matchCronField(field, value, min, max, isDayOfWeek = false) {
+  return field.split(",").some((segment) => matchCronSegment(segment.trim(), value, min, max, isDayOfWeek));
+}
+
+function matchCronSegment(segment, value, min, max, isDayOfWeek) {
+  if (!segment) return false;
+
+  const [base, stepText] = segment.split("/");
+  const step = stepText === undefined ? 1 : Number(stepText);
+  if (!Number.isInteger(step) || step < 1) return false;
+
+  let start = min;
+  let end = max;
+
+  if (base !== "*") {
+    if (base.includes("-")) {
+      const [rangeStart, rangeEnd] = base.split("-").map(Number);
+      start = normalizeCronValue(rangeStart, isDayOfWeek);
+      end = normalizeCronValue(rangeEnd, isDayOfWeek);
+    } else {
+      start = normalizeCronValue(Number(base), isDayOfWeek);
+      end = start;
+    }
+  }
+
+  const normalizedValue = normalizeCronValue(value, isDayOfWeek);
+  if (!Number.isInteger(start) || !Number.isInteger(end)) return false;
+  if (start < min || end > max || start > end) return false;
+  if (normalizedValue < start || normalizedValue > end) return false;
+
+  return (normalizedValue - start) % step === 0;
+}
+
+function normalizeCronValue(value, isDayOfWeek) {
+  if (isDayOfWeek && value === 7) return 0;
+  return value;
+}
+
 function isVpsOnline(info) {
   return readVpsStatus(info) === 1;
 }
@@ -302,6 +455,10 @@ function readVpsIp(info) {
   const ip = info?.info?.ip;
   if (Array.isArray(ip)) return ip[0] || "";
   return "";
+}
+
+function readVpsHostname(info) {
+  return info?.info?.hostname || info?.info?.vps?.hostname || "";
 }
 
 function readIpFromVirtualizorList(item) {
@@ -697,7 +854,8 @@ const APP_HTML = `<!doctype html>
         settings = await api("/api/vps/refresh", { method: "POST", body: "{}" });
         await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
         render();
-        setNotice(mainNotice, "已从 Virtualizor 拉取 VPS 列表。");
+        const total = settings.panels.reduce((sum, panel) => sum + panel.vps.length, 0);
+        setNotice(mainNotice, "已从 Virtualizor 拉取 VPS 列表，数量：" + total);
       } catch (error) {
         setNotice(mainNotice, error.message, true);
       }
@@ -708,8 +866,9 @@ const APP_HTML = `<!doctype html>
         collectPanelForm();
         await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
         const result = await api("/api/check-now", { method: "POST", body: "{}" });
+        settings = await api("/api/settings");
         state = await api("/api/state");
-        renderState();
+        render();
         setNotice(mainNotice, "检查完成，数量：" + result.checked);
       } catch (error) {
         setNotice(mainNotice, error.message, true);
@@ -816,7 +975,7 @@ const APP_HTML = `<!doctype html>
 
       target.innerHTML = \`
         <table class="table">
-          <thead><tr><th>启用</th><th>名称</th><th>VPS ID</th><th>IP</th><th>状态</th><th>自动启动</th><th>阈值</th><th>操作</th></tr></thead>
+          <thead><tr><th>启用</th><th>名称</th><th>VPS ID</th><th>IP</th><th>状态</th><th>Cron</th><th>自动启动</th><th>阈值</th><th>失败</th><th>最后检查</th><th>操作</th></tr></thead>
           <tbody>
             \${panel.vps.map((vps, index) => \`
               <tr>
@@ -825,8 +984,11 @@ const APP_HTML = `<!doctype html>
                 <td>\${escapeHtml(vps.id)}</td>
                 <td>\${escapeHtml(vps.ip || "-")}</td>
                 <td>\${statusBadge(vps.status)}</td>
+                <td><input data-vps-field="cron" data-vps-index="\${index}" value="\${escapeAttr(vps.cron || "*/5 * * * *")}" placeholder="*/5 * * * *"></td>
                 <td><input class="switch" data-vps-field="autoStart" data-vps-index="\${index}" type="checkbox" \${vps.autoStart ? "checked" : ""}></td>
                 <td><input data-vps-field="failureThreshold" data-vps-index="\${index}" type="number" min="1" value="\${vps.failureThreshold || 2}"></td>
+                <td>\${vps.failureCount || 0}</td>
+                <td>\${escapeHtml(vps.lastCheckedAt || "-")}</td>
                 <td><button data-start-vps="\${escapeAttr(vps.id)}">启动</button></td>
               </tr>
             \`).join("")}

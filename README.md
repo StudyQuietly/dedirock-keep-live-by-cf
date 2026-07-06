@@ -6,9 +6,10 @@ Cloudflare Workers 版 DediRock / Virtualizor VPS 保活工具。
 
 - 支持配置多个 Virtualizor End-user Panel。
 - 通过 Virtualizor End-user API 拉取 VPS 列表。
-- 支持按 VPS 开关监控、自动启动、离线阈值。
-- Worker Cron 定时检查 VPS 状态。
+- 支持按 VPS 开关监控、自动启动、独立 cron 表达式和离线阈值。
+- Worker 每分钟唤醒一次，再按每台 VPS 的 cron 表达式判断是否检查。
 - VPS 离线次数达到阈值后调用 Virtualizor `act=start`。
+- 每次检查后同步更新配置页中的 VPS 状态、IP、失败次数和检查时间。
 - 提供前端配置页面，使用 `ADMIN_TOKEN` 保护管理 API。
 
 ## 部署
@@ -48,7 +49,10 @@ npx wrangler deploy
 3. 填入 Virtualizor 的 API Key 和 API Password。
 4. 点击“拉取 VPS”。
 5. 为需要监控的 VPS 开启“启用”和“自动启动”。
-6. 保存配置。
+6. 为每台 VPS 配置 cron 表达式和离线阈值，例如 `*/5 * * * *` 表示每 5 分钟检查一次。
+7. 保存配置。
+
+cron 使用 UTC 时间，支持 `*`、`*/n`、逗号和范围表达式。
 
 ## Virtualizor API
 
