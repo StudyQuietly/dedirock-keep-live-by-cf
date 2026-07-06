@@ -3,7 +3,7 @@ const STATE_KEY = "monitor-state";
 const START_LOCK_KEY_PREFIX = "start-lock:";
 const DEFAULT_VPS_CRON = "*/5 * * * *";
 const DEFAULT_START_COOLDOWN_MINUTES = 15;
-const MAX_EVENT_LOGS = 100;
+const MAX_EVENT_LOGS_PER_VPS = 100;
 
 const DEFAULT_SETTINGS = {
   checkIntervalNote: "Worker wakes up every minute; each VPS controls its own cron schedule.",
@@ -524,10 +524,26 @@ function appendMonitorEvent(state, result) {
     startResult: result.startResult || null
   };
 
-  state.events = [event, ...(Array.isArray(state.events) ? state.events : [])].slice(0, MAX_EVENT_LOGS);
+  state.events = limitEventsPerVps([event, ...(Array.isArray(state.events) ? state.events : [])], MAX_EVENT_LOGS_PER_VPS);
   if (important) {
     state.importantEvents = [event, ...(Array.isArray(state.importantEvents) ? state.importantEvents : [])];
   }
+}
+
+function limitEventsPerVps(events, maxPerVps) {
+  const counts = new Map();
+  const limited = [];
+
+  for (const event of events) {
+    const key = `${event.panelId}:${event.vpsId}`;
+    const count = counts.get(key) || 0;
+    if (count >= maxPerVps) continue;
+
+    counts.set(key, count + 1);
+    limited.push(event);
+  }
+
+  return limited;
 }
 
 function isCronDue(expression, date) {
@@ -1168,7 +1184,7 @@ const APP_HTML = `<!doctype html>
       <section class="card stack">
         <div class="between">
           <h2>事件日志</h2>
-          <span class="muted">最多保留最近 100 条</span>
+          <span class="muted">每台 VPS 保留最近 100 条</span>
         </div>
         <div class="row">
           <select id="eventLogType">
@@ -1449,16 +1465,17 @@ const APP_HTML = `<!doctype html>
     }
 
     function renderStatusOverview() {
-      const groups = (settings.panels || [])
-        .map((panel) => ({
-          panel,
-          vps: (panel.vps || []).filter((vps) => vps.enabled)
-        }))
-        .filter((group) => group.vps.length);
-      const services = groups.flatMap((group) => group.vps.map((vps) => ({ panel: group.panel, vps })));
+      const panel = settings.panels.find((item) => item.id === selectedPanelId);
+      if (!panel) {
+        statusOverview.innerHTML = '<div class="empty">暂无面板。</div>';
+        return;
+      }
+
+      const vpsList = panel.vps || [];
+      const services = vpsList.map((vps) => ({ panel, vps }));
 
       if (!services.length) {
-        statusOverview.innerHTML = '<div class="empty">暂无启用 VPS。</div>';
+        statusOverview.innerHTML = '<div class="empty">当前面板暂无 VPS。</div>';
         return;
       }
 
@@ -1472,14 +1489,12 @@ const APP_HTML = `<!doctype html>
           </div>
         </div>
         <div class="status-groups">
-          \${groups.map((group) => \`
-            <div class="status-group">
-              <div class="status-group-title">\${escapeHtml(group.panel.name || "Virtualizor Panel")}</div>
-              <div class="status-list">
-                \${group.vps.map((vps) => statusOverviewRow(group.panel, vps)).join("")}
-              </div>
+          <div class="status-group">
+            <div class="status-group-title">\${escapeHtml(panel.name || "Virtualizor Panel")}</div>
+            <div class="status-list">
+              \${vpsList.map((vps) => statusOverviewRow(panel, vps)).join("")}
             </div>
-          \`).join("")}
+          </div>
         </div>
         <div class="status-footer">最后更新于 \${escapeHtml(state.lastRunAt || "-")}</div>
       \`;
@@ -1488,9 +1503,9 @@ const APP_HTML = `<!doctype html>
     function statusOverviewRow(panel, vps) {
       const key = panel.id + ":" + vps.id;
       const row = (state.vps || {})[key];
-      const serviceStatus = getServiceStatus(row);
-      const availability = calculateAvailability(key, row);
-      const history = buildStatusHistory(key, row);
+      const serviceStatus = getServiceStatus(row, vps);
+      const availability = calculateAvailability(key, row, vps);
+      const history = buildStatusHistory(key, row, vps);
       const name = vps.name || vps.hostname || vps.id;
 
       return \`
@@ -1516,15 +1531,15 @@ const APP_HTML = `<!doctype html>
     }
 
     function summarizeStatusOverview(services) {
-      const counts = { ok: 0, warn: 0, down: 0, unknown: 0 };
+      const counts = { ok: 0, warn: 0, down: 0, unknown: 0, disabled: 0 };
 
       for (const { panel, vps } of services) {
         const key = panel.id + ":" + vps.id;
-        const status = getServiceStatus((state.vps || {})[key]);
+        const status = getServiceStatus((state.vps || {})[key], vps);
         counts[status.level] += 1;
       }
 
-      const detail = services.length + " 台启用 VPS，在线 " + counts.ok + "，异常 " + counts.down + "，启动中 " + counts.warn + "，未检查 " + counts.unknown;
+      const detail = services.length + " 台 VPS，在线 " + counts.ok + "，异常 " + counts.down + "，启动中 " + counts.warn + "，未检查 " + counts.unknown + "，未启用 " + counts.disabled;
       if (counts.down > 0) {
         return { level: "down", title: "存在 VPS 离线或检查失败", detail };
       }
@@ -1534,10 +1549,14 @@ const APP_HTML = `<!doctype html>
       if (counts.unknown > 0) {
         return { level: "warn", title: "部分 VPS 尚未检查", detail };
       }
-      return { level: "ok", title: "所有启用 VPS 运行正常", detail };
+      if (counts.ok > 0) {
+        return { level: "ok", title: "当前面板 VPS 运行正常", detail };
+      }
+      return { level: "warn", title: "当前面板 VPS 未启用", detail };
     }
 
-    function getServiceStatus(row) {
+    function getServiceStatus(row, vps) {
+      if (!vps.enabled) return { level: "disabled", label: "Disabled", badgeClass: "" };
       if (!row?.checkedAt) return { level: "unknown", label: "Unknown", badgeClass: "" };
       if (row.error) return { level: "down", label: "Error", badgeClass: "down" };
       if (row.online) return { level: "ok", label: "Online", badgeClass: "ok" };
@@ -1546,16 +1565,17 @@ const APP_HTML = `<!doctype html>
       return { level: "down", label: "Offline", badgeClass: "down" };
     }
 
-    function calculateAvailability(key, row) {
-      const samples = getStatusSamples(key, row).filter((sample) => sample.status !== "unknown");
+    function calculateAvailability(key, row, vps) {
+      if (!vps.enabled) return "未启用";
+      const samples = getStatusSamples(key, row, vps).filter((sample) => sample.status !== "unknown");
       if (!samples.length) return "暂无数据";
 
       const ok = samples.filter((sample) => sample.status === "ok").length;
       return Math.round((ok / samples.length) * 100) + "%";
     }
 
-    function buildStatusHistory(key, row) {
-      const samples = getStatusSamples(key, row).reverse();
+    function buildStatusHistory(key, row, vps) {
+      const samples = getStatusSamples(key, row, vps).reverse();
       const padded = Array(Math.max(0, 48 - samples.length)).fill(null).map(() => unknownStatusSample()).concat(samples).slice(-48);
       const firstKnown = padded.find((sample) => sample.at);
       const startLabel = firstKnown?.at ? relativeTime(firstKnown.at) : "暂无";
@@ -1563,7 +1583,11 @@ const APP_HTML = `<!doctype html>
       return { segments: padded, startLabel };
     }
 
-    function getStatusSamples(key, row) {
+    function getStatusSamples(key, row, vps) {
+      if (!vps.enabled) {
+        return [statusSample("unknown", "未启用", null)];
+      }
+
       const samples = getStatusEvents(key).map(eventStatusSample);
       if (!samples.length && row?.checkedAt) {
         samples.push(rowStatusSample(row));
