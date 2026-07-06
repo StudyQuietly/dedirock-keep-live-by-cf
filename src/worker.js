@@ -828,6 +828,28 @@ const APP_HTML = `<!doctype html>
       border-color: var(--primary);
       background: var(--primary-soft);
     }
+    .segmented {
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      padding: 3px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f7f9fc;
+    }
+    .segmented button {
+      min-height: 30px;
+      border-color: transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 0 10px;
+    }
+    .segmented button.active {
+      border-color: var(--primary);
+      background: #fff;
+      color: var(--primary);
+      box-shadow: 0 1px 3px rgb(23 32 51 / 10%);
+    }
     .table {
       width: 100%;
       border-collapse: collapse;
@@ -1168,7 +1190,13 @@ const APP_HTML = `<!doctype html>
       <section class="card stack">
         <div class="between">
           <h2>状态总览</h2>
-          <span class="muted">仅管理页可见</span>
+          <div class="row">
+            <span class="muted">仅管理页可见</span>
+            <div class="segmented" id="statusOverviewScope">
+              <button class="active" type="button" data-status-scope="current">当前面板</button>
+              <button type="button" data-status-scope="all">所有面板</button>
+            </div>
+          </div>
         </div>
         <div id="statusOverview"></div>
       </section>
@@ -1216,6 +1244,7 @@ const APP_HTML = `<!doctype html>
     const panelList = document.querySelector("#panelList");
     const panelEditor = document.querySelector("#panelEditor");
     const statusOverview = document.querySelector("#statusOverview");
+    const statusOverviewScope = document.querySelector("#statusOverviewScope");
     const stateTable = document.querySelector("#stateTable");
     const eventTable = document.querySelector("#eventTable");
     const eventLogType = document.querySelector("#eventLogType");
@@ -1228,6 +1257,7 @@ const APP_HTML = `<!doctype html>
     let settings = { defaultFailureThreshold: 2, panels: [] };
     let state = { lastRunAt: null, vps: {} };
     let selectedPanelId = null;
+    let selectedStatusScope = "current";
 
     tokenInput.value = sessionStorage.getItem("adminToken") || "";
 
@@ -1240,6 +1270,12 @@ const APP_HTML = `<!doctype html>
     document.querySelector("#addPanelBtn").addEventListener("click", addPanel);
     document.querySelector("#refreshBtn").addEventListener("click", refreshVps);
     document.querySelector("#checkBtn").addEventListener("click", checkNow);
+    statusOverviewScope.querySelectorAll("[data-status-scope]").forEach((button) => {
+      button.addEventListener("click", () => {
+        selectedStatusScope = button.dataset.statusScope;
+        renderStatusOverview();
+      });
+    });
     eventLogType.addEventListener("change", renderEvents);
     eventLevelFilter.addEventListener("change", renderEvents);
     eventVpsFilter.addEventListener("change", renderEvents);
@@ -1465,17 +1501,18 @@ const APP_HTML = `<!doctype html>
     }
 
     function renderStatusOverview() {
-      const panel = settings.panels.find((item) => item.id === selectedPanelId);
-      if (!panel) {
-        statusOverview.innerHTML = '<div class="empty">暂无面板。</div>';
+      renderStatusOverviewScope();
+
+      const groups = getStatusOverviewGroups();
+      const services = groups.flatMap((group) => group.vps.map((vps) => ({ panel: group.panel, vps })));
+
+      if (!groups.length) {
+        statusOverview.innerHTML = '<div class="empty">' + (selectedStatusScope === "all" ? "暂无面板。" : "暂无当前面板。") + '</div>';
         return;
       }
 
-      const vpsList = panel.vps || [];
-      const services = vpsList.map((vps) => ({ panel, vps }));
-
       if (!services.length) {
-        statusOverview.innerHTML = '<div class="empty">当前面板暂无 VPS。</div>';
+        statusOverview.innerHTML = '<div class="empty">' + (selectedStatusScope === "all" ? "所有面板暂无 VPS。" : "当前面板暂无 VPS。") + '</div>';
         return;
       }
 
@@ -1489,15 +1526,32 @@ const APP_HTML = `<!doctype html>
           </div>
         </div>
         <div class="status-groups">
-          <div class="status-group">
-            <div class="status-group-title">\${escapeHtml(panel.name || "Virtualizor Panel")}</div>
-            <div class="status-list">
-              \${vpsList.map((vps) => statusOverviewRow(panel, vps)).join("")}
+          \${groups.map((group) => \`
+            <div class="status-group">
+              <div class="status-group-title">\${escapeHtml(group.panel.name || "Virtualizor Panel")}</div>
+              <div class="status-list">
+                \${group.vps.map((vps) => statusOverviewRow(group.panel, vps)).join("")}
+              </div>
             </div>
-          </div>
+          \`).join("")}
         </div>
         <div class="status-footer">最后更新于 \${escapeHtml(state.lastRunAt || "-")}</div>
       \`;
+    }
+
+    function renderStatusOverviewScope() {
+      statusOverviewScope.querySelectorAll("[data-status-scope]").forEach((button) => {
+        button.classList.toggle("active", button.dataset.statusScope === selectedStatusScope);
+      });
+    }
+
+    function getStatusOverviewGroups() {
+      if (selectedStatusScope === "all") {
+        return (settings.panels || []).map((panel) => ({ panel, vps: panel.vps || [] }));
+      }
+
+      const panel = settings.panels.find((item) => item.id === selectedPanelId);
+      return panel ? [{ panel, vps: panel.vps || [] }] : [];
     }
 
     function statusOverviewRow(panel, vps) {
@@ -1550,9 +1604,9 @@ const APP_HTML = `<!doctype html>
         return { level: "warn", title: "部分 VPS 尚未检查", detail };
       }
       if (counts.ok > 0) {
-        return { level: "ok", title: "当前面板 VPS 运行正常", detail };
+        return { level: "ok", title: selectedStatusScope === "all" ? "所有面板 VPS 运行正常" : "当前面板 VPS 运行正常", detail };
       }
-      return { level: "warn", title: "当前面板 VPS 未启用", detail };
+      return { level: "warn", title: selectedStatusScope === "all" ? "所有面板 VPS 未启用" : "当前面板 VPS 未启用", detail };
     }
 
     function getServiceStatus(row, vps) {
