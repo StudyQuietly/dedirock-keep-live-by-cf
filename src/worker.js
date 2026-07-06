@@ -1,6 +1,8 @@
 const CONFIG_KEY = "settings";
 const STATE_KEY = "monitor-state";
+const START_LOCK_KEY_PREFIX = "start-lock:";
 const DEFAULT_VPS_CRON = "*/5 * * * *";
+const DEFAULT_START_COOLDOWN_MINUTES = 15;
 const MAX_EVENT_LOGS = 100;
 
 const DEFAULT_SETTINGS = {
@@ -73,7 +75,7 @@ export default {
         const body = await request.json();
         const settings = await getSettings(env);
         const { panel, vps } = findConfiguredVps(settings, body.panelId, body.vpsId);
-        const result = await startVirtualizorVps(panel, vps.id);
+        const result = await startVirtualizorVpsWithCooldown(env, panel, vps, new Date());
         return jsonResponse({ ok: true, panelId: panel.id, vpsId: vps.id, result });
       }
 
@@ -109,6 +111,9 @@ async function runMonitor(env, options = {}) {
         online: false,
         failureCount: previous.failureCount || 0,
         started: false,
+        startSuppressed: false,
+        lastStartAttemptAt: previous.lastStartAttemptAt || null,
+        startCooldownUntil: previous.startCooldownUntil || null,
         error: null
       };
 
@@ -125,16 +130,31 @@ async function runMonitor(env, options = {}) {
 
         if (result.online) {
           result.failureCount = 0;
+          result.lastStartAttemptAt = null;
+          result.startCooldownUntil = null;
+          if (previous.lastStartAttemptAt || previous.startCooldownUntil) {
+            await clearStartLock(env, key);
+          }
         } else {
           result.failureCount += 1;
           const threshold = Number(vps.failureThreshold || settings.defaultFailureThreshold || 2);
           if (vps.autoStart && result.failureCount >= threshold) {
-            result.startResult = await startVirtualizorVps(panel, vps.id);
-            result.started = true;
-            result.failureCount = 0;
+            const startAttempt = await startVirtualizorVpsWithCooldown(env, panel, vps, now);
+            result.startSuppressed = startAttempt.startSuppressed;
+            result.lastStartAttemptAt = startAttempt.lastStartAttemptAt;
+            result.startCooldownUntil = startAttempt.startCooldownUntil;
+            if (startAttempt.started) {
+              result.startResult = startAttempt.startResult;
+              result.started = true;
+              result.failureCount = 0;
+            }
           }
         }
       } catch (error) {
+        if (error.startAttempt) {
+          result.lastStartAttemptAt = error.startAttempt.lastStartAttemptAt;
+          result.startCooldownUntil = error.startAttempt.startCooldownUntil;
+        }
         result.error = error.message || String(error);
         result.failureCount += 1;
       }
@@ -172,6 +192,7 @@ async function refreshConfiguredVps(settings) {
       autoStart: existing.get(String(item.id))?.autoStart ?? true,
       cron: existing.get(String(item.id))?.cron || DEFAULT_VPS_CRON,
       failureThreshold: existing.get(String(item.id))?.failureThreshold || settings.defaultFailureThreshold || 2,
+      startCooldownMinutes: existing.get(String(item.id))?.startCooldownMinutes || DEFAULT_START_COOLDOWN_MINUTES,
       lastCheckedAt: existing.get(String(item.id))?.lastCheckedAt || null
     }));
 
@@ -258,6 +279,70 @@ async function getVirtualizorVpsInfo(panel, vpsId) {
 
 async function startVirtualizorVps(panel, vpsId) {
   return virtualizorRequest(panel, { act: "start", svs: vpsId, do: "1" });
+}
+
+async function startVirtualizorVpsWithCooldown(env, panel, vps, now) {
+  const key = `${panel.id}:${vps.id}`;
+  const lockKey = `${START_LOCK_KEY_PREFIX}${key}`;
+  const cooldownMinutes = positiveInteger(vps.startCooldownMinutes, DEFAULT_START_COOLDOWN_MINUTES);
+  const activeLock = await getStartLock(env, lockKey, now);
+
+  if (activeLock) {
+    return {
+      started: false,
+      startSuppressed: true,
+      lastStartAttemptAt: activeLock.lastStartAttemptAt,
+      startCooldownUntil: activeLock.startCooldownUntil
+    };
+  }
+
+  const lastStartAttemptAt = now.toISOString();
+  const startCooldownUntil = new Date(now.getTime() + cooldownMinutes * 60 * 1000).toISOString();
+  const startAttempt = { lastStartAttemptAt, startCooldownUntil };
+
+  await putStartLock(env, lockKey, startAttempt, cooldownMinutes);
+
+  try {
+    const startResult = await startVirtualizorVps(panel, vps.id);
+    return {
+      started: true,
+      startSuppressed: false,
+      lastStartAttemptAt,
+      startCooldownUntil,
+      startResult
+    };
+  } catch (error) {
+    error.startAttempt = startAttempt;
+    throw error;
+  }
+}
+
+async function getStartLock(env, lockKey, now) {
+  ensureKv(env);
+  const lock = await env.CONFIG.get(lockKey, "json");
+  if (!lock?.startCooldownUntil) return null;
+
+  const cooldownUntil = new Date(lock.startCooldownUntil);
+  if (!Number.isFinite(cooldownUntil.getTime()) || cooldownUntil <= now) {
+    return null;
+  }
+
+  return {
+    lastStartAttemptAt: lock.lastStartAttemptAt || null,
+    startCooldownUntil: lock.startCooldownUntil
+  };
+}
+
+async function putStartLock(env, lockKey, value, cooldownMinutes) {
+  ensureKv(env);
+  await env.CONFIG.put(lockKey, JSON.stringify(value), {
+    expirationTtl: Math.max(60, cooldownMinutes * 60)
+  });
+}
+
+async function clearStartLock(env, key) {
+  ensureKv(env);
+  await env.CONFIG.delete(`${START_LOCK_KEY_PREFIX}${key}`);
 }
 
 async function virtualizorRequest(panel, params) {
@@ -369,9 +454,12 @@ function normalizeVps(input) {
     autoStart: Boolean(input.autoStart ?? true),
     cron: String(input.cron || DEFAULT_VPS_CRON).trim(),
     failureThreshold: positiveInteger(input.failureThreshold, 2),
+    startCooldownMinutes: positiveInteger(input.startCooldownMinutes, DEFAULT_START_COOLDOWN_MINUTES),
     lastCheckedAt: input.lastCheckedAt || null,
     lastOnline: input.lastOnline === undefined ? null : Boolean(input.lastOnline),
-    failureCount: Number(input.failureCount || 0)
+    failureCount: Number(input.failureCount || 0),
+    lastStartAttemptAt: input.lastStartAttemptAt || null,
+    startCooldownUntil: input.startCooldownUntil || null
   };
 }
 
@@ -407,11 +495,13 @@ function syncConfiguredVpsStatus(vps, result) {
 
   vps.lastCheckedAt = result.checkedAt;
   vps.failureCount = result.failureCount || 0;
+  vps.lastStartAttemptAt = result.lastStartAttemptAt || null;
+  vps.startCooldownUntil = result.startCooldownUntil || null;
 }
 
 function appendMonitorEvent(state, result) {
-  const type = result.started ? "start" : result.error ? "error" : result.online ? "online" : "offline";
-  const level = result.error ? "error" : result.started || !result.online ? "warn" : "info";
+  const type = result.started ? "start" : result.startSuppressed ? "start-suppressed" : result.error ? "error" : result.online ? "online" : "offline";
+  const level = result.error ? "error" : result.started || result.startSuppressed || !result.online ? "warn" : "info";
   const important = result.started || Boolean(result.error);
   const event = {
     id: crypto.randomUUID(),
@@ -427,6 +517,9 @@ function appendMonitorEvent(state, result) {
     status: Number.isFinite(result.status) ? result.status : null,
     failureCount: result.failureCount || 0,
     started: Boolean(result.started),
+    startSuppressed: Boolean(result.startSuppressed),
+    lastStartAttemptAt: result.lastStartAttemptAt || null,
+    startCooldownUntil: result.startCooldownUntil || null,
     error: result.error || null,
     startResult: result.startResult || null
   };
@@ -970,8 +1063,12 @@ const APP_HTML = `<!doctype html>
 
     async function startVps(panelId, vpsId) {
       try {
-        await api("/api/vps/start", { method: "POST", body: JSON.stringify({ panelId, vpsId }) });
-        setNotice(mainNotice, "已发送启动命令。");
+        const response = await api("/api/vps/start", { method: "POST", body: JSON.stringify({ panelId, vpsId }) });
+        if (response.result?.startSuppressed) {
+          setNotice(mainNotice, "启动防重中，冷却至：" + response.result.startCooldownUntil);
+        } else {
+          setNotice(mainNotice, "已发送启动命令。");
+        }
       } catch (error) {
         setNotice(mainNotice, error.message, true);
       }
@@ -1083,7 +1180,7 @@ const APP_HTML = `<!doctype html>
 
       target.innerHTML = \`
         <table class="table">
-          <thead><tr><th>启用</th><th>名称</th><th>VPS ID</th><th>IP</th><th>状态</th><th>Cron</th><th>自动启动</th><th>阈值</th><th>失败</th><th>最后检查</th><th>操作</th></tr></thead>
+          <thead><tr><th>启用</th><th>名称</th><th>VPS ID</th><th>IP</th><th>状态</th><th>Cron</th><th>自动启动</th><th>阈值</th><th>防重分钟</th><th>失败</th><th>最后检查</th><th>操作</th></tr></thead>
           <tbody>
             \${panel.vps.map((vps, index) => \`
               <tr>
@@ -1095,6 +1192,7 @@ const APP_HTML = `<!doctype html>
                 <td><input data-vps-field="cron" data-vps-index="\${index}" value="\${escapeAttr(vps.cron || "*/5 * * * *")}" placeholder="*/5 * * * *"></td>
                 <td><input class="switch" data-vps-field="autoStart" data-vps-index="\${index}" type="checkbox" \${vps.autoStart ? "checked" : ""}></td>
                 <td><input data-vps-field="failureThreshold" data-vps-index="\${index}" type="number" min="1" value="\${vps.failureThreshold || 2}"></td>
+                <td><input data-vps-field="startCooldownMinutes" data-vps-index="\${index}" type="number" min="1" value="\${vps.startCooldownMinutes || 15}"></td>
                 <td>\${vps.failureCount || 0}</td>
                 <td>\${escapeHtml(vps.lastCheckedAt || "-")}</td>
                 <td><button data-start-vps="\${escapeAttr(vps.id)}">启动</button></td>
@@ -1127,7 +1225,7 @@ const APP_HTML = `<!doctype html>
                 <td>\${escapeHtml(row.name || row.vpsId)}</td>
                 <td>\${row.online ? '<span class="badge ok">Online</span>' : '<span class="badge down">Offline</span>'}</td>
                 <td>\${row.failureCount || 0}</td>
-                <td>\${row.started ? '<span class="badge warn">已执行</span>' : '-'}</td>
+                <td>\${startStateBadge(row)}</td>
                 <td>\${escapeHtml(row.error || "-")}</td>
                 <td>\${escapeHtml(row.checkedAt || "-")}</td>
               </tr>
@@ -1234,9 +1332,16 @@ const APP_HTML = `<!doctype html>
 
     function eventBadge(row) {
       if (row.started) return '<span class="badge warn">Start</span>';
+      if (row.startSuppressed) return '<span class="badge warn">Cooldown</span>';
       if (row.error) return '<span class="badge down">Error</span>';
       if (row.online) return '<span class="badge ok">Online</span>';
       return '<span class="badge down">Offline</span>';
+    }
+
+    function startStateBadge(row) {
+      if (row.started) return '<span class="badge warn">已执行</span>';
+      if (row.startSuppressed) return '<span class="badge warn">防重中</span>';
+      return "-";
     }
 
     function levelBadge(level) {
