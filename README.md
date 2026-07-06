@@ -1,0 +1,67 @@
+# DediRock Keep Live by Cloudflare Workers
+
+Cloudflare Workers 版 DediRock / Virtualizor VPS 保活工具。
+
+首版功能：
+
+- 支持配置多个 Virtualizor End-user Panel。
+- 通过 Virtualizor End-user API 拉取 VPS 列表。
+- 支持按 VPS 开关监控、自动启动、离线阈值。
+- Worker Cron 定时检查 VPS 状态。
+- VPS 离线次数达到阈值后调用 Virtualizor `act=start`。
+- 提供前端配置页面，使用 `ADMIN_TOKEN` 保护管理 API。
+
+## 部署
+
+1. 创建 KV：
+
+```bash
+npx wrangler kv namespace create CONFIG
+```
+
+2. 把输出的 KV namespace id 写入 `wrangler.toml`：
+
+```toml
+[[kv_namespaces]]
+binding = "CONFIG"
+id = "你的 KV namespace id"
+```
+
+3. 设置管理 Token：
+
+```bash
+npx wrangler secret put ADMIN_TOKEN
+```
+
+4. 部署：
+
+```bash
+npx wrangler deploy
+```
+
+## 使用
+
+打开 Worker 地址，输入 `ADMIN_TOKEN` 后：
+
+1. 新增面板。
+2. 填入 Virtualizor 面板地址，例如 `https://vpanel.dedirock.com:4083`。
+3. 填入 Virtualizor 的 API Key 和 API Password。
+4. 点击“拉取 VPS”。
+5. 为需要监控的 VPS 开启“启用”和“自动启动”。
+6. 保存配置。
+
+## Virtualizor API
+
+项目使用的是 Virtualizor End-user API：
+
+- 拉取 VPS：`act=listvs`
+- 查询 VPS：`act=vpsmanage&svs=<VPS_ID>`
+- 启动 VPS：`act=start&svs=<VPS_ID>&do=1`
+
+## 安全说明
+
+Virtualizor API Key 和 API Password 会保存到 Worker KV。请确保：
+
+- Worker 管理页面只给自己使用。
+- `ADMIN_TOKEN` 使用足够强的随机字符串。
+- 不要公开分享 Worker 管理地址和 Token。

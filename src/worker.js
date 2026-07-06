@@ -1,0 +1,916 @@
+const CONFIG_KEY = "settings";
+const STATE_KEY = "monitor-state";
+
+const DEFAULT_SETTINGS = {
+  checkIntervalNote: "Cron is configured in wrangler.toml.",
+  defaultFailureThreshold: 2,
+  panels: []
+};
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/") {
+      return htmlResponse(APP_HTML);
+    }
+
+    if (url.pathname === "/api/health") {
+      return jsonResponse({ ok: true });
+    }
+
+    if (!url.pathname.startsWith("/api/")) {
+      return jsonResponse({ error: "Not found" }, 404);
+    }
+
+    const authError = requireAdmin(request, env);
+    if (authError) return authError;
+
+    try {
+      if (url.pathname === "/api/settings") {
+        if (request.method === "GET") {
+          return jsonResponse(await getSettings(env));
+        }
+
+        if (request.method === "PUT") {
+          const body = await request.json();
+          const settings = normalizeSettings(body);
+          await putJson(env, CONFIG_KEY, settings);
+          return jsonResponse(settings);
+        }
+      }
+
+      if (url.pathname === "/api/state" && request.method === "GET") {
+        return jsonResponse(await getState(env));
+      }
+
+      if (url.pathname === "/api/panels/test" && request.method === "POST") {
+        const panel = normalizePanel(await request.json());
+        const list = await listVirtualizorVps(panel);
+        return jsonResponse({ ok: true, vps: list });
+      }
+
+      if (url.pathname === "/api/vps/refresh" && request.method === "POST") {
+        const settings = await getSettings(env);
+        const refreshed = await refreshConfiguredVps(settings);
+        return jsonResponse(refreshed);
+      }
+
+      if (url.pathname === "/api/check-now" && request.method === "POST") {
+        const result = await runMonitor(env);
+        return jsonResponse(result);
+      }
+
+      if (url.pathname === "/api/vps/start" && request.method === "POST") {
+        const body = await request.json();
+        const settings = await getSettings(env);
+        const { panel, vps } = findConfiguredVps(settings, body.panelId, body.vpsId);
+        const result = await startVirtualizorVps(panel, vps.id);
+        return jsonResponse({ ok: true, panelId: panel.id, vpsId: vps.id, result });
+      }
+
+      return jsonResponse({ error: "Not found" }, 404);
+    } catch (error) {
+      return jsonResponse({ error: error.message || String(error) }, 500);
+    }
+  },
+
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(runMonitor(env));
+  }
+};
+
+async function runMonitor(env) {
+  const settings = await getSettings(env);
+  const state = await getState(env);
+  const checks = [];
+
+  for (const panel of settings.panels.filter((item) => item.enabled)) {
+    for (const vps of panel.vps.filter((item) => item.enabled)) {
+      const key = `${panel.id}:${vps.id}`;
+      const previous = state.vps[key] || {};
+      const result = {
+        panelId: panel.id,
+        panelName: panel.name,
+        vpsId: vps.id,
+        name: vps.name,
+        checkedAt: new Date().toISOString(),
+        online: false,
+        failureCount: previous.failureCount || 0,
+        started: false,
+        error: null
+      };
+
+      try {
+        const info = await getVirtualizorVpsInfo(panel, vps.id);
+        result.online = isVpsOnline(info);
+        result.status = readVpsStatus(info);
+        result.ip = readVpsIp(info);
+
+        if (result.online) {
+          result.failureCount = 0;
+        } else {
+          result.failureCount += 1;
+          const threshold = Number(vps.failureThreshold || settings.defaultFailureThreshold || 2);
+          if (vps.autoStart && result.failureCount >= threshold) {
+            result.startResult = await startVirtualizorVps(panel, vps.id);
+            result.started = true;
+            result.failureCount = 0;
+          }
+        }
+      } catch (error) {
+        result.error = error.message || String(error);
+        result.failureCount += 1;
+      }
+
+      state.vps[key] = result;
+      checks.push(result);
+    }
+  }
+
+  state.lastRunAt = new Date().toISOString();
+  await putJson(env, STATE_KEY, state);
+  return { ok: true, checked: checks.length, checks };
+}
+
+async function refreshConfiguredVps(settings) {
+  const panels = [];
+
+  for (const panel of settings.panels) {
+    const remoteVps = await listVirtualizorVps(panel);
+    const existing = new Map(panel.vps.map((item) => [String(item.id), item]));
+    const merged = remoteVps.map((item) => ({
+      id: String(item.id),
+      name: existing.get(String(item.id))?.name || item.name || item.hostname || `VPS ${item.id}`,
+      hostname: item.hostname || "",
+      ip: item.ip || "",
+      status: item.status,
+      enabled: existing.get(String(item.id))?.enabled ?? true,
+      autoStart: existing.get(String(item.id))?.autoStart ?? true,
+      failureThreshold: existing.get(String(item.id))?.failureThreshold || settings.defaultFailureThreshold || 2
+    }));
+
+    panels.push({ ...panel, vps: merged });
+  }
+
+  return { ...settings, panels };
+}
+
+async function listVirtualizorVps(panel) {
+  const data = await virtualizorRequest(panel, { act: "listvs" });
+  const entries = Object.entries(data).filter(([, value]) => value && typeof value === "object" && value.vpsid);
+
+  return entries.map(([, item]) => ({
+    id: String(item.vpsid),
+    name: item.vps_name || item.hostname || `VPS ${item.vpsid}`,
+    hostname: item.hostname || "",
+    ip: readIpFromVirtualizorList(item),
+    status: Number(item.status)
+  }));
+}
+
+async function getVirtualizorVpsInfo(panel, vpsId) {
+  return virtualizorRequest(panel, { act: "vpsmanage", svs: vpsId });
+}
+
+async function startVirtualizorVps(panel, vpsId) {
+  return virtualizorRequest(panel, { act: "start", svs: vpsId, do: "1" });
+}
+
+async function virtualizorRequest(panel, params) {
+  const baseUrl = normalizeBaseUrl(panel.baseUrl);
+  const url = new URL("/index.php", baseUrl);
+
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
+
+  url.searchParams.set("api", "json");
+  url.searchParams.set("apikey", panel.apiKey);
+  url.searchParams.set("apipass", panel.apiPass);
+
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: { Accept: "application/json" }
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Virtualizor ${response.status}: ${text.slice(0, 200)}`);
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Virtualizor returned non-JSON response: ${text.slice(0, 200)}`);
+  }
+
+  if (data.error && typeof data.error === "string") {
+    throw new Error(data.error);
+  }
+
+  return data;
+}
+
+async function getSettings(env) {
+  const settings = await getJson(env, CONFIG_KEY, DEFAULT_SETTINGS);
+  return normalizeSettings(settings);
+}
+
+async function getState(env) {
+  return getJson(env, STATE_KEY, { lastRunAt: null, vps: {} });
+}
+
+async function getJson(env, key, fallback) {
+  ensureKv(env);
+  const value = await env.CONFIG.get(key, "json");
+  return value || structuredClone(fallback);
+}
+
+async function putJson(env, key, value) {
+  ensureKv(env);
+  await env.CONFIG.put(key, JSON.stringify(value, null, 2));
+}
+
+function normalizeSettings(input) {
+  return {
+    checkIntervalNote: DEFAULT_SETTINGS.checkIntervalNote,
+    defaultFailureThreshold: positiveInteger(input.defaultFailureThreshold, 2),
+    panels: Array.isArray(input.panels) ? input.panels.map(normalizePanel) : []
+  };
+}
+
+function normalizePanel(input) {
+  const id = String(input.id || crypto.randomUUID());
+  return {
+    id,
+    name: String(input.name || "Virtualizor Panel").trim(),
+    baseUrl: normalizeBaseUrl(input.baseUrl || ""),
+    apiKey: String(input.apiKey || "").trim(),
+    apiPass: String(input.apiPass || "").trim(),
+    enabled: Boolean(input.enabled ?? true),
+    vps: Array.isArray(input.vps) ? input.vps.map(normalizeVps) : []
+  };
+}
+
+function normalizeVps(input) {
+  return {
+    id: String(input.id || "").trim(),
+    name: String(input.name || input.hostname || input.id || "VPS").trim(),
+    hostname: String(input.hostname || "").trim(),
+    ip: String(input.ip || "").trim(),
+    status: input.status === undefined ? null : Number(input.status),
+    enabled: Boolean(input.enabled ?? true),
+    autoStart: Boolean(input.autoStart ?? true),
+    failureThreshold: positiveInteger(input.failureThreshold, 2)
+  };
+}
+
+function normalizeBaseUrl(value) {
+  const trimmed = String(value || "").trim().replace(/\/+$/, "");
+  if (!trimmed) return "";
+  const url = new URL(trimmed);
+  return `${url.protocol}//${url.host}`;
+}
+
+function positiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function findConfiguredVps(settings, panelId, vpsId) {
+  const panel = settings.panels.find((item) => item.id === panelId);
+  if (!panel) throw new Error("Panel not found");
+
+  const vps = panel.vps.find((item) => item.id === String(vpsId));
+  if (!vps) throw new Error("VPS not found");
+
+  return { panel, vps };
+}
+
+function isVpsOnline(info) {
+  return readVpsStatus(info) === 1;
+}
+
+function readVpsStatus(info) {
+  const status = info?.info?.status ?? info?.status ?? info?.info?.vps?.status;
+  return Number(status);
+}
+
+function readVpsIp(info) {
+  const ip = info?.info?.ip;
+  if (Array.isArray(ip)) return ip[0] || "";
+  return "";
+}
+
+function readIpFromVirtualizorList(item) {
+  if (!item.ips || typeof item.ips !== "object") return "";
+  return Object.values(item.ips)[0] || "";
+}
+
+function ensureKv(env) {
+  if (!env.CONFIG) {
+    throw new Error("Missing KV binding: CONFIG");
+  }
+}
+
+function requireAdmin(request, env) {
+  if (!env.ADMIN_TOKEN) {
+    return jsonResponse({ error: "Missing secret: ADMIN_TOKEN" }, 500);
+  }
+
+  const authorization = request.headers.get("Authorization") || "";
+  const bearer = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+  const token = request.headers.get("X-Admin-Token") || bearer;
+
+  if (token !== env.ADMIN_TOKEN) {
+    return jsonResponse({ error: "Unauthorized" }, 401);
+  }
+
+  return null;
+}
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store"
+    }
+  });
+}
+
+function htmlResponse(html) {
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store"
+    }
+  });
+}
+
+const APP_HTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DediRock Keep Live</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #647089;
+      --line: #dfe5ef;
+      --primary: #2454d6;
+      --primary-soft: #e8efff;
+      --danger: #c93030;
+      --ok: #16803c;
+      --warn: #9a6500;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    button, input {
+      font: inherit;
+    }
+    button {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      min-height: 36px;
+      padding: 0 12px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button.primary {
+      border-color: var(--primary);
+      background: var(--primary);
+      color: #fff;
+    }
+    button.danger {
+      border-color: #f0c7c7;
+      color: var(--danger);
+    }
+    button:disabled {
+      opacity: .55;
+      cursor: not-allowed;
+    }
+    input {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 7px 10px;
+      background: #fff;
+      color: var(--text);
+    }
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .shell {
+      display: grid;
+      grid-template-columns: 270px 1fr;
+      min-height: 100vh;
+    }
+    aside {
+      border-right: 1px solid var(--line);
+      background: #fff;
+      padding: 20px;
+    }
+    main {
+      padding: 24px;
+    }
+    h1 {
+      margin: 0 0 4px;
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 0;
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+    .muted {
+      color: var(--muted);
+    }
+    .stack {
+      display: grid;
+      gap: 16px;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .between {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .panel-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .panel-tab {
+      width: 100%;
+      text-align: left;
+      height: auto;
+      padding: 10px;
+      border-radius: 6px;
+      background: #fff;
+    }
+    .panel-tab.active {
+      border-color: var(--primary);
+      background: var(--primary-soft);
+    }
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 8px;
+      text-align: left;
+      vertical-align: middle;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      background: #fafbfe;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 24px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #eef2f7;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .badge.ok {
+      color: var(--ok);
+      background: #e8f6ee;
+    }
+    .badge.down {
+      color: var(--danger);
+      background: #fdecec;
+    }
+    .badge.warn {
+      color: var(--warn);
+      background: #fff4dd;
+    }
+    .switch {
+      width: auto;
+    }
+    .notice {
+      min-height: 20px;
+      color: var(--muted);
+    }
+    .notice.error {
+      color: var(--danger);
+    }
+    .empty {
+      padding: 28px;
+      text-align: center;
+      color: var(--muted);
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    @media (max-width: 860px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+      aside {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      main {
+        padding: 16px;
+      }
+      .grid {
+        grid-template-columns: 1fr;
+      }
+      .table {
+        display: block;
+        overflow-x: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <div class="stack">
+        <div>
+          <h1>DediRock Keep Live</h1>
+          <div class="muted">Virtualizor VPS monitor</div>
+        </div>
+        <label>
+          管理 Token
+          <input id="adminToken" type="password" autocomplete="current-password" placeholder="ADMIN_TOKEN">
+        </label>
+        <div class="row">
+          <button class="primary" id="loadBtn">连接</button>
+          <button id="saveTokenBtn">记住本次会话</button>
+        </div>
+        <div class="notice" id="sideNotice"></div>
+        <div class="panel-list" id="panelList"></div>
+      </div>
+    </aside>
+
+    <main class="stack">
+      <section class="card stack">
+        <div class="between">
+          <div>
+            <h2>全局操作</h2>
+            <div class="muted">Cron 会按 wrangler.toml 里的频率执行。</div>
+          </div>
+          <div class="row">
+            <button id="addPanelBtn">新增面板</button>
+            <button id="refreshBtn">拉取 VPS</button>
+            <button id="checkBtn">立即检查</button>
+            <button class="primary" id="saveBtn">保存配置</button>
+          </div>
+        </div>
+        <label style="max-width: 240px;">
+          默认离线阈值
+          <input id="defaultFailureThreshold" type="number" min="1" step="1">
+        </label>
+        <div class="notice" id="mainNotice"></div>
+      </section>
+
+      <section class="card stack" id="panelEditor"></section>
+      <section class="card stack">
+        <div class="between">
+          <h2>最近状态</h2>
+          <span class="muted" id="lastRunAt">未检查</span>
+        </div>
+        <div id="stateTable"></div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const tokenInput = document.querySelector("#adminToken");
+    const sideNotice = document.querySelector("#sideNotice");
+    const mainNotice = document.querySelector("#mainNotice");
+    const panelList = document.querySelector("#panelList");
+    const panelEditor = document.querySelector("#panelEditor");
+    const stateTable = document.querySelector("#stateTable");
+    const lastRunAt = document.querySelector("#lastRunAt");
+    const defaultFailureThreshold = document.querySelector("#defaultFailureThreshold");
+
+    let settings = { defaultFailureThreshold: 2, panels: [] };
+    let state = { lastRunAt: null, vps: {} };
+    let selectedPanelId = null;
+
+    tokenInput.value = sessionStorage.getItem("adminToken") || "";
+
+    document.querySelector("#saveTokenBtn").addEventListener("click", () => {
+      sessionStorage.setItem("adminToken", tokenInput.value.trim());
+      setNotice(sideNotice, "已保存到本次浏览器会话。");
+    });
+    document.querySelector("#loadBtn").addEventListener("click", loadAll);
+    document.querySelector("#saveBtn").addEventListener("click", saveSettings);
+    document.querySelector("#addPanelBtn").addEventListener("click", addPanel);
+    document.querySelector("#refreshBtn").addEventListener("click", refreshVps);
+    document.querySelector("#checkBtn").addEventListener("click", checkNow);
+
+    function authHeaders() {
+      return {
+        "Content-Type": "application/json",
+        "X-Admin-Token": tokenInput.value.trim()
+      };
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: { ...authHeaders(), ...(options.headers || {}) }
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "请求失败");
+      return data;
+    }
+
+    async function loadAll() {
+      try {
+        setNotice(sideNotice, "读取中...");
+        settings = await api("/api/settings");
+        state = await api("/api/state");
+        selectedPanelId = settings.panels[0]?.id || null;
+        render();
+        setNotice(sideNotice, "已连接。");
+      } catch (error) {
+        setNotice(sideNotice, error.message, true);
+      }
+    }
+
+    async function saveSettings() {
+      try {
+        settings.defaultFailureThreshold = Number(defaultFailureThreshold.value || 2);
+        collectPanelForm();
+        settings = await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
+        render();
+        setNotice(mainNotice, "配置已保存。");
+      } catch (error) {
+        setNotice(mainNotice, error.message, true);
+      }
+    }
+
+    async function refreshVps() {
+      try {
+        collectPanelForm();
+        await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
+        settings = await api("/api/vps/refresh", { method: "POST", body: "{}" });
+        await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
+        render();
+        setNotice(mainNotice, "已从 Virtualizor 拉取 VPS 列表。");
+      } catch (error) {
+        setNotice(mainNotice, error.message, true);
+      }
+    }
+
+    async function checkNow() {
+      try {
+        collectPanelForm();
+        await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
+        const result = await api("/api/check-now", { method: "POST", body: "{}" });
+        state = await api("/api/state");
+        renderState();
+        setNotice(mainNotice, "检查完成，数量：" + result.checked);
+      } catch (error) {
+        setNotice(mainNotice, error.message, true);
+      }
+    }
+
+    async function startVps(panelId, vpsId) {
+      try {
+        await api("/api/vps/start", { method: "POST", body: JSON.stringify({ panelId, vpsId }) });
+        setNotice(mainNotice, "已发送启动命令。");
+      } catch (error) {
+        setNotice(mainNotice, error.message, true);
+      }
+    }
+
+    function addPanel() {
+      const panel = {
+        id: crypto.randomUUID(),
+        name: "DediRock",
+        baseUrl: "https://vpanel.dedirock.com:4083",
+        apiKey: "",
+        apiPass: "",
+        enabled: true,
+        vps: []
+      };
+      settings.panels.push(panel);
+      selectedPanelId = panel.id;
+      render();
+    }
+
+    function removePanel(id) {
+      settings.panels = settings.panels.filter((panel) => panel.id !== id);
+      selectedPanelId = settings.panels[0]?.id || null;
+      render();
+    }
+
+    function render() {
+      defaultFailureThreshold.value = settings.defaultFailureThreshold || 2;
+      renderPanelList();
+      renderPanelEditor();
+      renderState();
+    }
+
+    function renderPanelList() {
+      panelList.innerHTML = "";
+      if (!settings.panels.length) {
+        panelList.innerHTML = '<div class="empty">暂无面板</div>';
+        return;
+      }
+
+      for (const panel of settings.panels) {
+        const btn = document.createElement("button");
+        btn.className = "panel-tab" + (panel.id === selectedPanelId ? " active" : "");
+        btn.innerHTML = '<strong>' + escapeHtml(panel.name) + '</strong><br><span class="muted">' + escapeHtml(panel.baseUrl) + '</span>';
+        btn.addEventListener("click", () => {
+          collectPanelForm();
+          selectedPanelId = panel.id;
+          render();
+        });
+        panelList.appendChild(btn);
+      }
+    }
+
+    function renderPanelEditor() {
+      const panel = settings.panels.find((item) => item.id === selectedPanelId);
+      if (!panel) {
+        panelEditor.innerHTML = '<div class="empty">新增一个 Virtualizor 面板后开始配置。</div>';
+        return;
+      }
+
+      panelEditor.innerHTML = \`
+        <div class="between">
+          <h2>面板配置</h2>
+          <div class="row">
+            <label class="row" style="gap: 6px; color: var(--muted);">
+              <input class="switch" id="panelEnabled" type="checkbox" \${panel.enabled ? "checked" : ""}>启用
+            </label>
+            <button class="danger" id="removePanelBtn">删除面板</button>
+          </div>
+        </div>
+        <div class="grid">
+          <label>名称<input id="panelName" value="\${escapeAttr(panel.name)}"></label>
+          <label>面板地址<input id="panelBaseUrl" value="\${escapeAttr(panel.baseUrl)}" placeholder="https://vpanel.dedirock.com:4083"></label>
+          <label>API Key<input id="panelApiKey" value="\${escapeAttr(panel.apiKey)}"></label>
+          <label>API Password<input id="panelApiPass" type="password" value="\${escapeAttr(panel.apiPass)}"></label>
+        </div>
+        <div class="between">
+          <h2>VPS</h2>
+          <span class="muted">通过“拉取 VPS”从 Virtualizor 获取。</span>
+        </div>
+        <div id="vpsTable"></div>
+      \`;
+
+      document.querySelector("#removePanelBtn").addEventListener("click", () => removePanel(panel.id));
+      renderVpsTable(panel);
+    }
+
+    function renderVpsTable(panel) {
+      const target = document.querySelector("#vpsTable");
+      if (!panel.vps.length) {
+        target.innerHTML = '<div class="empty">还没有 VPS 信息。</div>';
+        return;
+      }
+
+      target.innerHTML = \`
+        <table class="table">
+          <thead><tr><th>启用</th><th>名称</th><th>VPS ID</th><th>IP</th><th>状态</th><th>自动启动</th><th>阈值</th><th>操作</th></tr></thead>
+          <tbody>
+            \${panel.vps.map((vps, index) => \`
+              <tr>
+                <td><input class="switch" data-vps-field="enabled" data-vps-index="\${index}" type="checkbox" \${vps.enabled ? "checked" : ""}></td>
+                <td><input data-vps-field="name" data-vps-index="\${index}" value="\${escapeAttr(vps.name)}"></td>
+                <td>\${escapeHtml(vps.id)}</td>
+                <td>\${escapeHtml(vps.ip || "-")}</td>
+                <td>\${statusBadge(vps.status)}</td>
+                <td><input class="switch" data-vps-field="autoStart" data-vps-index="\${index}" type="checkbox" \${vps.autoStart ? "checked" : ""}></td>
+                <td><input data-vps-field="failureThreshold" data-vps-index="\${index}" type="number" min="1" value="\${vps.failureThreshold || 2}"></td>
+                <td><button data-start-vps="\${escapeAttr(vps.id)}">启动</button></td>
+              </tr>
+            \`).join("")}
+          </tbody>
+        </table>
+      \`;
+
+      target.querySelectorAll("[data-start-vps]").forEach((button) => {
+        button.addEventListener("click", () => startVps(panel.id, button.dataset.startVps));
+      });
+    }
+
+    function renderState() {
+      lastRunAt.textContent = state.lastRunAt ? "最后检查：" + state.lastRunAt : "未检查";
+      const rows = Object.values(state.vps || {});
+      if (!rows.length) {
+        stateTable.innerHTML = '<div class="empty">暂无检查结果。</div>';
+        return;
+      }
+
+      stateTable.innerHTML = \`
+        <table class="table">
+          <thead><tr><th>面板</th><th>VPS</th><th>状态</th><th>失败次数</th><th>启动</th><th>错误</th><th>时间</th></tr></thead>
+          <tbody>
+            \${rows.map((row) => \`
+              <tr>
+                <td>\${escapeHtml(row.panelName || row.panelId)}</td>
+                <td>\${escapeHtml(row.name || row.vpsId)}</td>
+                <td>\${row.online ? '<span class="badge ok">Online</span>' : '<span class="badge down">Offline</span>'}</td>
+                <td>\${row.failureCount || 0}</td>
+                <td>\${row.started ? '<span class="badge warn">已执行</span>' : '-'}</td>
+                <td>\${escapeHtml(row.error || "-")}</td>
+                <td>\${escapeHtml(row.checkedAt || "-")}</td>
+              </tr>
+            \`).join("")}
+          </tbody>
+        </table>
+      \`;
+    }
+
+    function collectPanelForm() {
+      const panel = settings.panels.find((item) => item.id === selectedPanelId);
+      if (!panel || !document.querySelector("#panelName")) return;
+
+      panel.name = document.querySelector("#panelName").value.trim();
+      panel.baseUrl = document.querySelector("#panelBaseUrl").value.trim();
+      panel.apiKey = document.querySelector("#panelApiKey").value.trim();
+      panel.apiPass = document.querySelector("#panelApiPass").value.trim();
+      panel.enabled = document.querySelector("#panelEnabled").checked;
+
+      document.querySelectorAll("[data-vps-field]").forEach((input) => {
+        const vps = panel.vps[Number(input.dataset.vpsIndex)];
+        const field = input.dataset.vpsField;
+        if (!vps) return;
+        if (input.type === "checkbox") {
+          vps[field] = input.checked;
+        } else if (input.type === "number") {
+          vps[field] = Number(input.value || 1);
+        } else {
+          vps[field] = input.value.trim();
+        }
+      });
+    }
+
+    function statusBadge(status) {
+      if (Number(status) === 1) return '<span class="badge ok">Online</span>';
+      if (Number(status) === 0) return '<span class="badge down">Offline</span>';
+      return '<span class="badge">Unknown</span>';
+    }
+
+    function setNotice(target, message, isError = false) {
+      target.textContent = message;
+      target.classList.toggle("error", isError);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
+      }[char]));
+    }
+
+    function escapeAttr(value) {
+      return escapeHtml(value);
+    }
+  </script>
+</body>
+</html>`;

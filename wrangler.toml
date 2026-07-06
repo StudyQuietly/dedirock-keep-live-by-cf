@@ -1,0 +1,10 @@
+name = "dedirock-keep-live"
+main = "src/worker.js"
+compatibility_date = "2026-07-06"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[kv_namespaces]]
+binding = "CONFIG"
+id = "replace_with_your_kv_namespace_id"
