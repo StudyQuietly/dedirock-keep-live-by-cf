@@ -12,6 +12,17 @@ const VIRTUALIZOR_REQUEST_TIMEOUT_MS = 15000;
 const DEFAULT_SETTINGS = {
   checkIntervalNote: "Worker wakes up every minute; each VPS controls its own cron schedule.",
   defaultFailureThreshold: 2,
+  notifications: {
+    enabled: false,
+    events: {
+      offline: true,
+      start: true,
+      recovered: true,
+      error: true
+    },
+    offlinePolicy: "threshold",
+    channels: []
+  },
   panels: []
 };
 
@@ -75,6 +86,13 @@ export default {
         return jsonResponse(result);
       }
 
+      if (url.pathname === "/api/notifications/test" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const settings = await getSettings(env);
+        const result = await sendTestNotification(settings, body.channelId || null);
+        return jsonResponse(result);
+      }
+
       if (url.pathname === "/api/vps/start" && request.method === "POST") {
         const body = await request.json();
         const settings = await getSettings(env);
@@ -128,8 +146,19 @@ async function runMonitorChecks(env, options = {}) {
 
   const checks = (await runWithConcurrency(jobs, MONITOR_CONCURRENCY)).filter(Boolean);
   for (const { key, result } of checks) {
+    const previous = state.vps[key] || {};
     state.vps[key] = result;
-    appendMonitorEvent(state, result);
+    const event = appendMonitorEvent(state, result);
+    if (event) {
+      const notificationResults = await sendNotificationsForEvent(settings, state, event, previous);
+      if (notificationResults.length) {
+        event.notificationResults = notificationResults;
+        if (notificationResults.some((item) => !item.ok)) {
+          event.important = true;
+          ensureImportantEvent(state, event);
+        }
+      }
+    }
   }
 
   state.lastRunAt = now.toISOString();
@@ -141,6 +170,7 @@ async function runMonitorChecks(env, options = {}) {
 async function checkConfiguredVps(env, settings, state, panel, vps, now, options) {
   const key = `${panel.id}:${vps.id}`;
   const previous = state.vps[key] || {};
+  const failureThreshold = Number(vps.failureThreshold || settings.defaultFailureThreshold || 2);
   const result = {
     panelId: panel.id,
     panelName: panel.name,
@@ -150,6 +180,7 @@ async function checkConfiguredVps(env, settings, state, panel, vps, now, options
     checkedAt: now.toISOString(),
     online: false,
     failureCount: previous.failureCount || 0,
+    failureThreshold,
     started: false,
     startSuppressed: false,
     lastStartAttemptAt: previous.lastStartAttemptAt || null,
@@ -177,8 +208,7 @@ async function checkConfiguredVps(env, settings, state, panel, vps, now, options
       }
     } else {
       result.failureCount += 1;
-      const threshold = Number(vps.failureThreshold || settings.defaultFailureThreshold || 2);
-      if (vps.autoStart && result.failureCount >= threshold) {
+      if (vps.autoStart && result.failureCount >= failureThreshold) {
         const startAttempt = await startVirtualizorVpsWithCooldown(env, panel, vps, now);
         result.startSuppressed = startAttempt.startSuppressed;
         result.lastStartAttemptAt = startAttempt.lastStartAttemptAt;
@@ -468,12 +498,13 @@ async function getSettings(env) {
 }
 
 async function getState(env) {
-  const state = await getJson(env, STATE_KEY, { lastRunAt: null, vps: {}, events: [], importantEvents: [] });
+  const state = await getJson(env, STATE_KEY, { lastRunAt: null, vps: {}, events: [], importantEvents: [], notifications: {} });
   return {
     lastRunAt: state.lastRunAt || null,
     vps: state.vps || {},
     events: Array.isArray(state.events) ? state.events : [],
-    importantEvents: Array.isArray(state.importantEvents) ? state.importantEvents : []
+    importantEvents: Array.isArray(state.importantEvents) ? state.importantEvents : [],
+    notifications: state.notifications && typeof state.notifications === "object" ? state.notifications : {}
   };
 }
 
@@ -507,8 +538,76 @@ function normalizeSettings(input) {
   return {
     checkIntervalNote: DEFAULT_SETTINGS.checkIntervalNote,
     defaultFailureThreshold: positiveInteger(input?.defaultFailureThreshold, 2),
+    notifications: normalizeNotifications(input?.notifications),
     panels: Array.isArray(input?.panels) ? input.panels.map(normalizePanel) : []
   };
+}
+
+function normalizeNotifications(input) {
+  const events = input?.events || {};
+  const offlinePolicy = ["first", "threshold", "every"].includes(input?.offlinePolicy) ? input.offlinePolicy : "threshold";
+  return {
+    enabled: Boolean(input?.enabled ?? false),
+    events: {
+      offline: Boolean(events.offline ?? true),
+      start: Boolean(events.start ?? true),
+      recovered: Boolean(events.recovered ?? true),
+      error: Boolean(events.error ?? true)
+    },
+    offlinePolicy,
+    channels: Array.isArray(input?.channels) ? input.channels.map(normalizeNotificationChannel) : []
+  };
+}
+
+function normalizeNotificationChannel(input) {
+  const provider = ["webhook", "serverChan", "pushPlus", "telegram", "feishu", "dingtalk", "wecom"].includes(input?.provider)
+    ? input.provider
+    : "webhook";
+  return {
+    id: String(input?.id || crypto.randomUUID()),
+    name: String(input?.name || notificationProviderLabel(provider)).trim(),
+    enabled: Boolean(input?.enabled ?? true),
+    provider,
+    config: normalizeNotificationConfig(provider, input?.config || {})
+  };
+}
+
+function normalizeNotificationConfig(provider, input) {
+  const config = {};
+  if (provider === "webhook") {
+    config.webhookUrl = String(input.webhookUrl || "").trim();
+  }
+  if (provider === "serverChan") {
+    config.sendKey = String(input.sendKey || "").trim();
+  }
+  if (provider === "pushPlus") {
+    config.token = String(input.token || "").trim();
+    config.topic = String(input.topic || "").trim();
+  }
+  if (provider === "telegram") {
+    config.botToken = String(input.botToken || "").trim();
+    config.chatId = String(input.chatId || "").trim();
+  }
+  if (provider === "feishu" || provider === "dingtalk") {
+    config.webhookUrl = String(input.webhookUrl || "").trim();
+    config.secret = String(input.secret || "").trim();
+  }
+  if (provider === "wecom") {
+    config.webhookUrl = String(input.webhookUrl || "").trim();
+  }
+  return config;
+}
+
+function notificationProviderLabel(provider) {
+  return {
+    webhook: "通用 Webhook",
+    serverChan: "Server 酱",
+    pushPlus: "PushPlus",
+    telegram: "Telegram Bot",
+    feishu: "飞书机器人",
+    dingtalk: "钉钉机器人",
+    wecom: "企业微信机器人"
+  }[provider] || "通知渠道";
 }
 
 function normalizePanel(input) {
@@ -590,18 +689,21 @@ function appendMonitorEvent(state, result) {
     online: result.online,
     status: Number.isFinite(result.status) ? result.status : null,
     failureCount: result.failureCount || 0,
+    failureThreshold: result.failureThreshold || null,
     started: Boolean(result.started),
     startSuppressed: Boolean(result.startSuppressed),
     lastStartAttemptAt: result.lastStartAttemptAt || null,
     startCooldownUntil: result.startCooldownUntil || null,
     error: result.error || null,
-    startResult: result.startResult || null
+    startResult: result.startResult || null,
+    notificationResults: []
   };
 
   state.events = limitEventsPerVps([event, ...(Array.isArray(state.events) ? state.events : [])], MAX_EVENT_LOGS_PER_VPS);
   if (important) {
     state.importantEvents = limitEventsPerVps([event, ...(Array.isArray(state.importantEvents) ? state.importantEvents : [])], MAX_EVENT_LOGS_PER_VPS);
   }
+  return event;
 }
 
 function limitEventsPerVps(events, maxPerVps) {
@@ -618,6 +720,337 @@ function limitEventsPerVps(events, maxPerVps) {
   }
 
   return limited;
+}
+
+function ensureImportantEvent(state, event) {
+  const importantEvents = Array.isArray(state.importantEvents) ? state.importantEvents : [];
+  if (importantEvents.some((item) => item.id === event.id)) {
+    return;
+  }
+  state.importantEvents = limitEventsPerVps([event, ...importantEvents], MAX_EVENT_LOGS_PER_VPS);
+}
+
+async function sendNotificationsForEvent(settings, state, event, previous) {
+  const notificationType = resolveNotificationType(event, previous);
+  if (event.online && !event.error) {
+    resetOutageNotificationState(state, event);
+  }
+
+  if (!notificationType) {
+    return [];
+  }
+
+  const notifications = settings.notifications || normalizeNotifications(null);
+  if (!notifications.enabled || !notifications.events?.[notificationType]) {
+    return [];
+  }
+
+  if (!shouldNotifyEvent(notifications, state, event, notificationType)) {
+    return [];
+  }
+
+  const channels = (notifications.channels || []).filter((channel) => channel.enabled);
+  if (!channels.length) {
+    return [];
+  }
+
+  const message = buildNotificationMessage(event, notificationType);
+  const results = await Promise.all(channels.map((channel) => sendNotificationChannel(channel, message, event)));
+  updateNotificationState(state, event, notificationType);
+  return results;
+}
+
+function resolveNotificationType(event, previous) {
+  if (event.started) return "start";
+  if (event.error) return "error";
+  if (event.online && previous?.checkedAt && (previous.online === false || previous.error)) return "recovered";
+  if (!event.online && !event.startSuppressed) return "offline";
+  return null;
+}
+
+function shouldNotifyEvent(notifications, state, event, notificationType) {
+  const key = `${event.panelId}:${event.vpsId}`;
+  const record = state.notifications?.[key] || {};
+
+  if (notificationType === "offline") {
+    if (notifications.offlinePolicy === "every") return true;
+    if (record.offlineNotified) return false;
+    if (notifications.offlinePolicy === "first") return true;
+    return Number(event.failureCount || 0) >= Number(event.failureThreshold || 1);
+  }
+
+  if (notificationType === "error") {
+    return !record.errorNotified;
+  }
+
+  if (notificationType === "recovered") {
+    return !record.recoveredNotified;
+  }
+
+  return true;
+}
+
+function resetOutageNotificationState(state, event) {
+  if (!state.notifications || typeof state.notifications !== "object") {
+    state.notifications = {};
+  }
+
+  const key = `${event.panelId}:${event.vpsId}`;
+  const record = state.notifications[key] || {};
+  record.offlineNotified = false;
+  record.errorNotified = false;
+  record.recoveredNotified = false;
+  state.notifications[key] = record;
+}
+
+function updateNotificationState(state, event, notificationType) {
+  if (!state.notifications || typeof state.notifications !== "object") {
+    state.notifications = {};
+  }
+
+  const key = `${event.panelId}:${event.vpsId}`;
+  const record = state.notifications[key] || {};
+
+  if (notificationType === "offline") {
+    record.offlineNotified = true;
+    record.recoveredNotified = false;
+    record.lastOfflineNotifiedAt = event.at;
+  }
+
+  if (notificationType === "error") {
+    record.errorNotified = true;
+    record.recoveredNotified = false;
+    record.lastErrorNotifiedAt = event.at;
+  }
+
+  if (notificationType === "recovered") {
+    record.recoveredNotified = true;
+    record.lastRecoveredNotifiedAt = event.at;
+  }
+
+  if (notificationType === "start") {
+    record.lastStartNotifiedAt = event.at;
+  }
+
+  state.notifications[key] = record;
+}
+
+async function sendTestNotification(settings, channelId) {
+  const notifications = settings.notifications || normalizeNotifications(null);
+  const channels = (notifications.channels || []).filter((channel) => {
+    if (channelId) return channel.id === channelId;
+    return channel.enabled;
+  });
+
+  if (!channels.length) {
+    throw httpError(400, channelId ? "Notification channel not found" : "No enabled notification channels");
+  }
+
+  const now = new Date().toISOString();
+  const event = {
+    id: crypto.randomUUID(),
+    type: "test",
+    level: "info",
+    at: now,
+    panelName: "Test Panel",
+    panelId: "test-panel",
+    vpsId: "test-vps",
+    name: "Test VPS",
+    online: true,
+    failureCount: 0,
+    error: null
+  };
+  const message = {
+    title: "VPS 通知测试",
+    content: ["这是一条测试通知。", `时间：${now}`].join("\n")
+  };
+  const results = await Promise.all(channels.map((channel) => sendNotificationChannel(channel, message, event)));
+  return { ok: results.every((item) => item.ok), results };
+}
+
+function buildNotificationMessage(event, notificationType) {
+  const titleMap = {
+    offline: "VPS 离线",
+    start: "VPS 启动命令成功",
+    recovered: "VPS 恢复在线",
+    error: "VPS 检查错误"
+  };
+  const lines = [
+    `面板：${event.panelName || event.panelId}`,
+    `VPS：${event.name || event.vpsId}`,
+    `VPS ID：${event.vpsId}`,
+    `状态：${event.error ? "Error" : event.online ? "Online" : "Offline"}`,
+    `失败次数：${event.failureCount || 0}`,
+    `时间：${event.at}`
+  ];
+
+  if (event.error) {
+    lines.push(`错误：${event.error}`);
+  }
+  if (event.startCooldownUntil) {
+    lines.push(`启动防重至：${event.startCooldownUntil}`);
+  }
+
+  return {
+    title: titleMap[notificationType] || "VPS 通知",
+    content: lines.join("\n")
+  };
+}
+
+async function sendNotificationChannel(channel, message, event) {
+  const sentAt = new Date().toISOString();
+  try {
+    await sendNotificationRequest(channel, message, event);
+    return notificationResult(channel, true, null, sentAt);
+  } catch (error) {
+    return notificationResult(channel, false, error.message || String(error), sentAt);
+  }
+}
+
+function notificationResult(channel, ok, error, sentAt) {
+  return {
+    channelId: channel.id,
+    channelName: channel.name,
+    provider: channel.provider,
+    ok,
+    error,
+    sentAt
+  };
+}
+
+async function sendNotificationRequest(channel, message, event) {
+  const config = channel.config || {};
+  if (channel.provider === "serverChan") {
+    requireNotificationValue(config.sendKey, "Server 酱 SendKey");
+    const body = new URLSearchParams({ title: message.title, desp: message.content });
+    return checkedNotificationFetch(`https://sctapi.ftqq.com/${encodeURIComponent(config.sendKey)}.send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body
+    });
+  }
+
+  if (channel.provider === "pushPlus") {
+    requireNotificationValue(config.token, "PushPlus Token");
+    return checkedNotificationFetch("https://www.pushplus.plus/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: config.token,
+        title: message.title,
+        content: message.content,
+        topic: config.topic || undefined,
+        template: "txt"
+      })
+    });
+  }
+
+  if (channel.provider === "telegram") {
+    requireNotificationValue(config.botToken, "Telegram Bot Token");
+    requireNotificationValue(config.chatId, "Telegram Chat ID");
+    return checkedNotificationFetch(`https://api.telegram.org/bot${encodeURIComponent(config.botToken)}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: config.chatId, text: `${message.title}\n\n${message.content}` })
+    });
+  }
+
+  if (channel.provider === "feishu") {
+    requireNotificationValue(config.webhookUrl, "飞书 Webhook URL");
+    const payload = {
+      msg_type: "text",
+      content: { text: `${message.title}\n${message.content}` }
+    };
+    if (config.secret) {
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      payload.timestamp = timestamp;
+      payload.sign = await signFeishu(timestamp, config.secret);
+    }
+    return checkedNotificationFetch(config.webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+  }
+
+  if (channel.provider === "dingtalk") {
+    requireNotificationValue(config.webhookUrl, "钉钉 Webhook URL");
+    const url = new URL(config.webhookUrl);
+    if (config.secret) {
+      const timestamp = String(Date.now());
+      url.searchParams.set("timestamp", timestamp);
+      url.searchParams.set("sign", await signDingtalk(timestamp, config.secret));
+    }
+    return checkedNotificationFetch(url.toString(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ msgtype: "text", text: { content: `${message.title}\n${message.content}` } })
+    });
+  }
+
+  if (channel.provider === "wecom") {
+    requireNotificationValue(config.webhookUrl, "企业微信 Webhook URL");
+    return checkedNotificationFetch(config.webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ msgtype: "text", text: { content: `${message.title}\n${message.content}` } })
+    });
+  }
+
+  requireNotificationValue(config.webhookUrl, "Webhook URL");
+  return checkedNotificationFetch(config.webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: message.title,
+      content: message.content,
+      event
+    })
+  });
+}
+
+function requireNotificationValue(value, label) {
+  if (!String(value || "").trim()) {
+    throw new Error(`Missing ${label}`);
+  }
+}
+
+async function checkedNotificationFetch(url, init) {
+  const response = await fetch(url, {
+    ...init,
+    signal: AbortSignal.timeout(VIRTUALIZOR_REQUEST_TIMEOUT_MS)
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Notification ${response.status}: ${text.slice(0, 200)}`);
+  }
+  return text;
+}
+
+async function signFeishu(timestamp, secret) {
+  return hmacSha256Base64("", `${timestamp}\n${secret}`);
+}
+
+async function signDingtalk(timestamp, secret) {
+  return hmacSha256Base64(`${timestamp}\n${secret}`, secret);
+}
+
+async function hmacSha256Base64(message, secret) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(message));
+  const bytes = new Uint8Array(signature);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
 }
 
 function validateCronExpression(expression) {
@@ -818,7 +1251,7 @@ const APP_HTML = `<!doctype html>
       color: var(--text);
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    button, input {
+    button, input, select {
       font: inherit;
     }
     button {
@@ -843,7 +1276,7 @@ const APP_HTML = `<!doctype html>
       opacity: .55;
       cursor: not-allowed;
     }
-    input {
+    input, select {
       width: 100%;
       min-height: 36px;
       border: 1px solid var(--line);
@@ -922,6 +1355,33 @@ const APP_HTML = `<!doctype html>
       gap: 12px;
       min-width: 0;
     }
+    .notification-events {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+    }
+    .notification-events label {
+      display: inline-flex;
+      grid-template-columns: none;
+      align-items: center;
+      gap: 6px;
+      min-height: 28px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .notification-channels {
+      display: grid;
+      gap: 12px;
+    }
+    .notification-channel {
+      display: grid;
+      gap: 12px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fafbfe;
+    }
     .panel-list {
       display: grid;
       gap: 10px;
@@ -971,7 +1431,7 @@ const APP_HTML = `<!doctype html>
       overflow: auto;
     }
     .event-log-table {
-      min-width: 980px;
+      min-width: 1120px;
       table-layout: fixed;
     }
     .event-log-table th {
@@ -1484,6 +1944,34 @@ const APP_HTML = `<!doctype html>
 
       <section class="card stack">
         <div class="between">
+          <div>
+            <h2>通知设置</h2>
+            <div class="muted">一个事件会发送到所有已启用渠道。</div>
+          </div>
+          <div class="row">
+            <button id="addNotificationChannelBtn" type="button">新增渠道</button>
+            <button id="testAllNotificationsBtn" type="button">测试全部</button>
+          </div>
+        </div>
+        <div class="grid">
+          <label class="row" style="gap: 6px; color: var(--muted);">
+            <input class="switch" id="notificationsEnabled" type="checkbox">启用通知
+          </label>
+          <label>
+            离线通知策略
+            <select id="notificationOfflinePolicy">
+              <option value="threshold">达到离线阈值</option>
+              <option value="first">首次离线</option>
+              <option value="every">每次离线</option>
+            </select>
+          </label>
+        </div>
+        <div class="notification-events" id="notificationEvents"></div>
+        <div class="notification-channels" id="notificationChannels"></div>
+      </section>
+
+      <section class="card stack">
+        <div class="between">
           <h2>状态总览</h2>
           <div class="row">
             <span class="muted">仅管理页可见</span>
@@ -1569,9 +2057,13 @@ const APP_HTML = `<!doctype html>
     const eventSearch = document.querySelector("#eventSearch");
     const lastRunAt = document.querySelector("#lastRunAt");
     const defaultFailureThreshold = document.querySelector("#defaultFailureThreshold");
+    const notificationsEnabled = document.querySelector("#notificationsEnabled");
+    const notificationOfflinePolicy = document.querySelector("#notificationOfflinePolicy");
+    const notificationEvents = document.querySelector("#notificationEvents");
+    const notificationChannels = document.querySelector("#notificationChannels");
     const AUTO_REFRESH_MS = 30000;
 
-    let settings = { defaultFailureThreshold: 2, panels: [] };
+    let settings = { defaultFailureThreshold: 2, notifications: defaultNotifications(), panels: [] };
     let state = { lastRunAt: null, vps: {} };
     let selectedPanelId = null;
     let selectedStatusScope = "current";
@@ -1594,6 +2086,8 @@ const APP_HTML = `<!doctype html>
     document.querySelector("#addPanelBtn").addEventListener("click", addPanel);
     document.querySelector("#refreshBtn").addEventListener("click", refreshVps);
     document.querySelector("#checkBtn").addEventListener("click", checkNow);
+    document.querySelector("#addNotificationChannelBtn").addEventListener("click", addNotificationChannel);
+    document.querySelector("#testAllNotificationsBtn").addEventListener("click", () => testNotifications(null));
     statusOverviewScope.querySelectorAll("[data-status-scope]").forEach((button) => {
       button.addEventListener("click", () => {
         selectedStatusScope = button.dataset.statusScope;
@@ -1612,6 +2106,21 @@ const APP_HTML = `<!doctype html>
       }
     });
     defaultFailureThreshold.addEventListener("focusout", autoSaveSettings);
+    notificationsEnabled.addEventListener("change", autoSaveSettings);
+    notificationOfflinePolicy.addEventListener("change", autoSaveSettings);
+    notificationEvents.addEventListener("change", autoSaveSettings);
+    notificationChannels.addEventListener("focusout", (event) => {
+      if (event.target.matches("input:not([type='checkbox']):not([type='radio'])")) {
+        autoSaveSettings();
+      }
+    });
+    notificationChannels.addEventListener("change", (event) => {
+      if (event.target.matches("input[type='checkbox'], select")) {
+        collectNotificationForm();
+        renderNotificationSettings();
+        autoSaveSettings();
+      }
+    });
     panelEditor.addEventListener("focusout", (event) => {
       if (event.target.matches("input:not([type='checkbox']):not([type='radio']), textarea")) {
         autoSaveSettings();
@@ -1735,6 +2244,7 @@ const APP_HTML = `<!doctype html>
 
     async function persistSettings({ renderAfterSave, updateLocalSettings }) {
       settings.defaultFailureThreshold = Number(defaultFailureThreshold.value || 2);
+      collectNotificationForm();
       collectPanelForm();
       const savedSettings = await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
       if (updateLocalSettings) {
@@ -1747,6 +2257,7 @@ const APP_HTML = `<!doctype html>
 
     async function refreshVps() {
       try {
+        collectNotificationForm();
         collectPanelForm();
         await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
         settings = await api("/api/vps/refresh", { method: "POST", body: "{}" });
@@ -1761,6 +2272,7 @@ const APP_HTML = `<!doctype html>
 
     async function checkNow() {
       try {
+        collectNotificationForm();
         collectPanelForm();
         await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
         const result = await api("/api/check-now", { method: "POST", body: "{}" });
@@ -1800,6 +2312,205 @@ const APP_HTML = `<!doctype html>
       }
     }
 
+    function defaultNotifications() {
+      return {
+        enabled: false,
+        events: { offline: true, start: true, recovered: true, error: true },
+        offlinePolicy: "threshold",
+        channels: []
+      };
+    }
+
+    function normalizeClientNotifications(value) {
+      const base = defaultNotifications();
+      const events = value?.events || {};
+      return {
+        enabled: Boolean(value?.enabled ?? base.enabled),
+        events: {
+          offline: Boolean(events.offline ?? true),
+          start: Boolean(events.start ?? true),
+          recovered: Boolean(events.recovered ?? true),
+          error: Boolean(events.error ?? true)
+        },
+        offlinePolicy: ["first", "threshold", "every"].includes(value?.offlinePolicy) ? value.offlinePolicy : "threshold",
+        channels: Array.isArray(value?.channels) ? value.channels.map(normalizeClientChannel) : []
+      };
+    }
+
+    function normalizeClientChannel(value) {
+      const provider = ["webhook", "serverChan", "pushPlus", "telegram", "feishu", "dingtalk", "wecom"].includes(value?.provider) ? value.provider : "webhook";
+      return {
+        id: value?.id || crypto.randomUUID(),
+        name: value?.name || providerLabel(provider),
+        enabled: Boolean(value?.enabled ?? true),
+        provider,
+        config: value?.config || {}
+      };
+    }
+
+    function addNotificationChannel() {
+      collectNotificationForm();
+      settings.notifications = normalizeClientNotifications(settings.notifications);
+      settings.notifications.channels.push({
+        id: crypto.randomUUID(),
+        name: "通用 Webhook",
+        enabled: true,
+        provider: "webhook",
+        config: { webhookUrl: "" }
+      });
+      renderNotificationSettings();
+    }
+
+    function removeNotificationChannel(id) {
+      collectNotificationForm();
+      settings.notifications.channels = settings.notifications.channels.filter((channel) => channel.id !== id);
+      renderNotificationSettings();
+      autoSaveSettings();
+    }
+
+    async function testNotifications(channelId) {
+      try {
+        await persistSettings({ renderAfterSave: false, updateLocalSettings: true });
+        const result = await api("/api/notifications/test", {
+          method: "POST",
+          body: JSON.stringify({ channelId })
+        });
+        const failed = (result.results || []).filter((item) => !item.ok);
+        if (failed.length) {
+          showMessage("通知测试失败：" + failed.map((item) => item.channelName + " " + item.error).join("；"), "error");
+        } else {
+          showMessage("通知测试成功，渠道数：" + (result.results || []).length, "success");
+        }
+      } catch (error) {
+        showMessage("通知测试失败：" + error.message, "error");
+      }
+    }
+
+    function renderNotificationSettings() {
+      const notifications = normalizeClientNotifications(settings.notifications);
+      settings.notifications = notifications;
+      notificationsEnabled.checked = notifications.enabled;
+      notificationOfflinePolicy.value = notifications.offlinePolicy;
+
+      const eventItems = [
+        ["offline", "VPS 离线"],
+        ["start", "启动命令成功"],
+        ["recovered", "恢复在线"],
+        ["error", "检查错误"]
+      ];
+      notificationEvents.innerHTML = eventItems.map((item) => {
+        const key = item[0];
+        const label = item[1];
+        return '<label><input class="switch" data-notification-event="' + key + '" type="checkbox"' + (notifications.events[key] ? " checked" : "") + '>' + label + '</label>';
+      }).join("");
+
+      if (!notifications.channels.length) {
+        notificationChannels.innerHTML = '<div class="empty">暂无通知渠道。</div>';
+        return;
+      }
+
+      notificationChannels.innerHTML = notifications.channels.map((channel, index) => {
+        return '<div class="notification-channel" data-channel-index="' + index + '">' +
+          '<div class="between">' +
+            '<div class="row">' +
+              '<label class="row" style="gap: 6px; color: var(--muted);"><input class="switch" data-channel-field="enabled" type="checkbox"' + (channel.enabled ? " checked" : "") + '>启用</label>' +
+              '<strong>' + escapeHtml(channel.name || providerLabel(channel.provider)) + '</strong>' +
+              '<span class="badge">' + escapeHtml(providerLabel(channel.provider)) + '</span>' +
+            '</div>' +
+            '<div class="row">' +
+              '<button type="button" data-test-channel="' + escapeAttr(channel.id) + '">测试</button>' +
+              '<button class="danger" type="button" data-remove-channel="' + escapeAttr(channel.id) + '">删除</button>' +
+            '</div>' +
+          '</div>' +
+          '<div class="grid">' +
+            '<label>渠道名称<input data-channel-field="name" value="' + escapeAttr(channel.name || "") + '"></label>' +
+            '<label>渠道类型' + providerSelect(channel.provider) + '</label>' +
+            channelConfigFields(channel) +
+          '</div>' +
+        '</div>';
+      }).join("");
+
+      notificationChannels.querySelectorAll("[data-remove-channel]").forEach((button) => {
+        button.addEventListener("click", () => removeNotificationChannel(button.dataset.removeChannel));
+      });
+      notificationChannels.querySelectorAll("[data-test-channel]").forEach((button) => {
+        button.addEventListener("click", () => testNotifications(button.dataset.testChannel));
+      });
+    }
+
+    function providerSelect(value) {
+      return '<select data-channel-field="provider">' +
+        providerOptions().map((item) => '<option value="' + item[0] + '"' + (item[0] === value ? " selected" : "") + '>' + item[1] + '</option>').join("") +
+        '</select>';
+    }
+
+    function providerOptions() {
+      return [
+        ["webhook", "通用 Webhook"],
+        ["serverChan", "Server 酱"],
+        ["pushPlus", "PushPlus"],
+        ["telegram", "Telegram Bot"],
+        ["feishu", "飞书机器人"],
+        ["dingtalk", "钉钉机器人"],
+        ["wecom", "企业微信机器人"]
+      ];
+    }
+
+    function providerLabel(provider) {
+      const item = providerOptions().find((option) => option[0] === provider);
+      return item ? item[1] : "通知渠道";
+    }
+
+    function channelConfigFields(channel) {
+      const config = channel.config || {};
+      if (channel.provider === "serverChan") {
+        return '<label>SendKey<input data-channel-config="sendKey" value="' + escapeAttr(config.sendKey || "") + '"></label>';
+      }
+      if (channel.provider === "pushPlus") {
+        return '<label>Token<input data-channel-config="token" value="' + escapeAttr(config.token || "") + '"></label>' +
+          '<label>Topic<input data-channel-config="topic" value="' + escapeAttr(config.topic || "") + '" placeholder="可选"></label>';
+      }
+      if (channel.provider === "telegram") {
+        return '<label>Bot Token<input data-channel-config="botToken" value="' + escapeAttr(config.botToken || "") + '"></label>' +
+          '<label>Chat ID<input data-channel-config="chatId" value="' + escapeAttr(config.chatId || "") + '"></label>';
+      }
+      if (channel.provider === "feishu" || channel.provider === "dingtalk") {
+        return '<label>Webhook URL<input data-channel-config="webhookUrl" value="' + escapeAttr(config.webhookUrl || "") + '"></label>' +
+          '<label>Secret<input data-channel-config="secret" value="' + escapeAttr(config.secret || "") + '" placeholder="可选"></label>';
+      }
+      return '<label>Webhook URL<input data-channel-config="webhookUrl" value="' + escapeAttr(config.webhookUrl || "") + '"></label>';
+    }
+
+    function collectNotificationForm() {
+      const notifications = normalizeClientNotifications(settings.notifications);
+      notifications.enabled = notificationsEnabled.checked;
+      notifications.offlinePolicy = notificationOfflinePolicy.value;
+      notificationEvents.querySelectorAll("[data-notification-event]").forEach((input) => {
+        notifications.events[input.dataset.notificationEvent] = input.checked;
+      });
+
+      notificationChannels.querySelectorAll("[data-channel-index]").forEach((item) => {
+        const channel = notifications.channels[Number(item.dataset.channelIndex)];
+        if (!channel) return;
+        channel.config = {};
+        item.querySelectorAll("[data-channel-field]").forEach((input) => {
+          if (input.dataset.channelField === "enabled") {
+            channel.enabled = input.checked;
+          } else {
+            channel[input.dataset.channelField] = input.value.trim();
+          }
+        });
+        item.querySelectorAll("[data-channel-config]").forEach((input) => {
+          channel.config[input.dataset.channelConfig] = input.value.trim();
+        });
+        if (!channel.name) {
+          channel.name = providerLabel(channel.provider);
+        }
+      });
+
+      settings.notifications = notifications;
+    }
+
     function addPanel() {
       const panel = {
         id: crypto.randomUUID(),
@@ -1823,6 +2534,8 @@ const APP_HTML = `<!doctype html>
 
     function render() {
       defaultFailureThreshold.value = settings.defaultFailureThreshold || 2;
+      settings.notifications = normalizeClientNotifications(settings.notifications);
+      renderNotificationSettings();
       renderPanelList();
       renderPanelEditor();
       renderEventFilters();
@@ -2245,7 +2958,8 @@ const APP_HTML = `<!doctype html>
           row.type,
           row.level,
           row.error,
-          summarizeStartResult(row.startResult)
+          summarizeStartResult(row.startResult),
+          summarizeNotificationResults(row.notificationResults)
         ].some((value) => String(value || "").toLowerCase().includes(keyword));
       });
 
@@ -2265,7 +2979,7 @@ const APP_HTML = `<!doctype html>
       eventTable.innerHTML = \`
         <div class="event-table-scroll">
           <table class="table event-log-table">
-          <thead><tr><th>时间</th><th>等级</th><th>类型</th><th>面板</th><th>VPS</th><th>状态</th><th>失败次数</th><th>启动结果</th><th>错误</th></tr></thead>
+          <thead><tr><th>时间</th><th>等级</th><th>类型</th><th>面板</th><th>VPS</th><th>状态</th><th>失败次数</th><th>启动结果</th><th>通知</th><th>错误</th></tr></thead>
           <tbody>
             \${pageRows.map((row) => \`
               <tr>
@@ -2277,6 +2991,7 @@ const APP_HTML = `<!doctype html>
                 <td>\${row.online ? '<span class="badge ok">Online</span>' : '<span class="badge down">Offline</span>'}</td>
                 <td>\${row.failureCount || 0}</td>
                 <td>\${escapeHtml(summarizeStartResult(row.startResult))}</td>
+                <td>\${escapeHtml(summarizeNotificationResults(row.notificationResults))}</td>
                 <td>\${escapeHtml(row.error || "-")}</td>
               </tr>
             \`).join("")}
@@ -2408,6 +3123,14 @@ const APP_HTML = `<!doctype html>
       if (value.done_msg) return value.done_msg;
       if (value.title) return value.title;
       return JSON.stringify(value).slice(0, 120);
+    }
+
+    function summarizeNotificationResults(value) {
+      if (!Array.isArray(value) || !value.length) return "-";
+      const ok = value.filter((item) => item.ok).length;
+      const failed = value.filter((item) => !item.ok);
+      if (!failed.length) return "成功 " + ok + "/" + value.length;
+      return "失败 " + failed.length + "/" + value.length + "：" + failed.map((item) => item.channelName + " " + item.error).join("；").slice(0, 160);
     }
 
     function setNotice(target, message, isError = false) {
