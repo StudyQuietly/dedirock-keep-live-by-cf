@@ -855,6 +855,26 @@ const APP_HTML = `<!doctype html>
       border-collapse: collapse;
       overflow: hidden;
     }
+    .event-table-scroll {
+      height: 451px;
+      overflow: auto;
+    }
+    .event-log-table {
+      min-width: 980px;
+      table-layout: fixed;
+    }
+    .event-log-table th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    .event-log-table th,
+    .event-log-table td {
+      height: 41px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     th, td {
       border-bottom: 1px solid var(--line);
       padding: 10px 8px;
@@ -1118,6 +1138,95 @@ const APP_HTML = `<!doctype html>
       text-align: center;
       font-size: 12px;
     }
+    .pagination {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 12px;
+      margin-top: 14px;
+      padding-top: 12px;
+      color: var(--text);
+      flex-wrap: wrap;
+    }
+    .pagination[hidden] {
+      display: none;
+    }
+    .pagination-size {
+      min-width: 132px;
+      height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0 34px 0 12px;
+      background-color: #fff;
+      background-image: url("data:image/svg+xml,%3Csvg width='16' height='16' viewBox='0 0 16 16' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M4 6L8 10L12 6' stroke='%23647089' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 12px center;
+      color: var(--text);
+      font: inherit;
+      font-size: 14px;
+      appearance: none;
+    }
+    .pagination-pages {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+    .pagination button {
+      min-width: 40px;
+      height: 40px;
+      border-color: transparent;
+      border-radius: 8px;
+      padding: 0 10px;
+      font-size: 14px;
+    }
+    .pagination-page {
+      background: transparent;
+      color: var(--text);
+    }
+    .pagination-page.active {
+      border-color: #0f63c6;
+      background: #0f63c6;
+      color: #fff;
+      font-weight: 700;
+    }
+    .pagination-nav {
+      background: #eaf2fb;
+      color: #0f63c6;
+      font-size: 22px;
+      line-height: 1;
+    }
+    .pagination-nav:disabled {
+      background: #f1f3f5;
+      color: #aeb8c5;
+      opacity: 1;
+    }
+    .pagination-ellipsis {
+      min-width: 28px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .pagination-jumper {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 14px;
+    }
+    .pagination-jumper input {
+      width: 82px;
+      height: 40px;
+      text-align: center;
+      font-size: 14px;
+    }
+    .pagination-jump {
+      min-width: 72px;
+      border-color: #0f63c6 !important;
+      background: #0f63c6 !important;
+      color: #fff !important;
+      font-weight: 700;
+    }
     @media (max-width: 860px) {
       .shell {
         grid-template-columns: 1fr;
@@ -1141,6 +1250,17 @@ const APP_HTML = `<!doctype html>
       }
       .status-summary {
         align-items: flex-start;
+      }
+      .pagination {
+        justify-content: flex-start;
+      }
+      .pagination-pages {
+        max-width: 100%;
+        overflow-x: auto;
+        padding-bottom: 2px;
+      }
+      .pagination-jumper input {
+        width: 72px;
       }
     }
   </style>
@@ -1233,6 +1353,21 @@ const APP_HTML = `<!doctype html>
           <button id="clearImportantLogsBtn" class="danger">清除重要</button>
         </div>
         <div id="eventTable"></div>
+        <div class="pagination" id="eventPagination" hidden>
+          <select class="pagination-size" id="eventPageSize" aria-label="每页条数">
+            <option value="10" selected>10条/页</option>
+            <option value="20">20条/页</option>
+            <option value="50">50条/页</option>
+            <option value="100">100条/页</option>
+          </select>
+          <div class="pagination-pages" id="eventPageButtons"></div>
+          <div class="pagination-jumper">
+            <span>前往</span>
+            <input id="eventPageJump" type="number" min="1" step="1" value="1" aria-label="跳转页码">
+            <span>页</span>
+            <button class="pagination-jump" id="eventPageJumpBtn" type="button">跳转</button>
+          </div>
+        </div>
       </section>
     </main>
   </div>
@@ -1247,9 +1382,14 @@ const APP_HTML = `<!doctype html>
     const statusOverviewScope = document.querySelector("#statusOverviewScope");
     const stateTable = document.querySelector("#stateTable");
     const eventTable = document.querySelector("#eventTable");
+    const eventPagination = document.querySelector("#eventPagination");
+    const eventPageButtons = document.querySelector("#eventPageButtons");
     const eventLogType = document.querySelector("#eventLogType");
     const eventLevelFilter = document.querySelector("#eventLevelFilter");
     const eventVpsFilter = document.querySelector("#eventVpsFilter");
+    const eventPageSize = document.querySelector("#eventPageSize");
+    const eventPageJump = document.querySelector("#eventPageJump");
+    const eventPageJumpBtn = document.querySelector("#eventPageJumpBtn");
     const eventSearch = document.querySelector("#eventSearch");
     const lastRunAt = document.querySelector("#lastRunAt");
     const defaultFailureThreshold = document.querySelector("#defaultFailureThreshold");
@@ -1258,6 +1398,7 @@ const APP_HTML = `<!doctype html>
     let state = { lastRunAt: null, vps: {} };
     let selectedPanelId = null;
     let selectedStatusScope = "current";
+    let eventPage = 1;
 
     tokenInput.value = sessionStorage.getItem("adminToken") || "";
 
@@ -1276,10 +1417,17 @@ const APP_HTML = `<!doctype html>
         renderStatusOverview();
       });
     });
-    eventLogType.addEventListener("change", renderEvents);
-    eventLevelFilter.addEventListener("change", renderEvents);
-    eventVpsFilter.addEventListener("change", renderEvents);
-    eventSearch.addEventListener("input", renderEvents);
+    eventLogType.addEventListener("change", resetEventPageAndRender);
+    eventLevelFilter.addEventListener("change", resetEventPageAndRender);
+    eventVpsFilter.addEventListener("change", resetEventPageAndRender);
+    eventPageSize.addEventListener("change", resetEventPageAndRender);
+    eventSearch.addEventListener("input", resetEventPageAndRender);
+    eventPageJumpBtn.addEventListener("click", jumpEventPage);
+    eventPageJump.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        jumpEventPage();
+      }
+    });
     document.querySelector("#clearRecentLogsBtn").addEventListener("click", () => clearLogs("recent"));
     document.querySelector("#clearImportantLogsBtn").addEventListener("click", () => clearLogs("important"));
 
@@ -1765,6 +1913,11 @@ const APP_HTML = `<!doctype html>
       eventVpsFilter.value = [...eventVpsFilter.options].some((option) => option.value === selected) ? selected : "all";
     }
 
+    function resetEventPageAndRender() {
+      eventPage = 1;
+      renderEvents();
+    }
+
     function renderEvents() {
       const source = eventLogType.value === "important" ? state.importantEvents || [] : state.events || [];
       const level = eventLevelFilter.value;
@@ -1789,14 +1942,23 @@ const APP_HTML = `<!doctype html>
 
       if (!rows.length) {
         eventTable.innerHTML = '<div class="empty">暂无事件日志。</div>';
+        eventPagination.hidden = true;
         return;
       }
 
+      const pageSize = Number(eventPageSize.value || 10);
+      const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+      eventPage = Math.min(Math.max(1, eventPage), totalPages);
+
+      const start = (eventPage - 1) * pageSize;
+      const pageRows = rows.slice(start, start + pageSize);
+
       eventTable.innerHTML = \`
-        <table class="table">
+        <div class="event-table-scroll">
+          <table class="table event-log-table">
           <thead><tr><th>时间</th><th>等级</th><th>类型</th><th>面板</th><th>VPS</th><th>状态</th><th>失败次数</th><th>启动结果</th><th>错误</th></tr></thead>
           <tbody>
-            \${rows.map((row) => \`
+            \${pageRows.map((row) => \`
               <tr>
                 <td>\${escapeHtml(row.at || "-")}</td>
                 <td>\${levelBadge(row.level)}</td>
@@ -1810,8 +1972,67 @@ const APP_HTML = `<!doctype html>
               </tr>
             \`).join("")}
           </tbody>
-        </table>
+          </table>
+        </div>
       \`;
+
+      renderEventPagination(totalPages);
+    }
+
+    function renderEventPagination(totalPages) {
+      eventPagination.hidden = false;
+      eventPageJump.max = String(totalPages);
+      eventPageJump.value = String(eventPage);
+
+      eventPageButtons.innerHTML = [
+        '<button class="pagination-nav" data-event-page="prev" type="button" aria-label="上一页"' + (eventPage <= 1 ? " disabled" : "") + '>&#8249;</button>',
+        ...getEventPageItems(totalPages).map((item) => {
+          if (item === "ellipsis") {
+            return '<span class="pagination-ellipsis">...</span>';
+          }
+
+          return '<button class="pagination-page' + (item === eventPage ? " active" : "") + '" data-event-page="' + item + '" type="button"' + (item === eventPage ? ' aria-current="page"' : "") + '>' + item + '</button>';
+        }),
+        '<button class="pagination-nav" data-event-page="next" type="button" aria-label="下一页"' + (eventPage >= totalPages ? " disabled" : "") + '>&#8250;</button>'
+      ].join("");
+
+      eventPageButtons.querySelectorAll("[data-event-page]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const target = button.dataset.eventPage;
+          if (target === "prev") {
+            eventPage -= 1;
+          } else if (target === "next") {
+            eventPage += 1;
+          } else {
+            eventPage = Number(target);
+          }
+          renderEvents();
+        });
+      });
+    }
+
+    function getEventPageItems(totalPages) {
+      if (totalPages <= 8) {
+        return Array.from({ length: totalPages }, (_, index) => index + 1);
+      }
+
+      if (eventPage <= 4) {
+        return [1, 2, 3, 4, 5, 6, "ellipsis", totalPages];
+      }
+
+      if (eventPage >= totalPages - 3) {
+        return [1, "ellipsis", totalPages - 5, totalPages - 4, totalPages - 3, totalPages - 2, totalPages - 1, totalPages];
+      }
+
+      return [1, "ellipsis", eventPage - 2, eventPage - 1, eventPage, eventPage + 1, eventPage + 2, "ellipsis", totalPages];
+    }
+
+    function jumpEventPage() {
+      const page = Number(eventPageJump.value);
+      if (!Number.isFinite(page) || page < 1) return;
+
+      eventPage = Math.trunc(page);
+      renderEvents();
     }
 
     function collectPanelForm() {
