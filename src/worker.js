@@ -1393,12 +1393,15 @@ const APP_HTML = `<!doctype html>
     const eventSearch = document.querySelector("#eventSearch");
     const lastRunAt = document.querySelector("#lastRunAt");
     const defaultFailureThreshold = document.querySelector("#defaultFailureThreshold");
+    const AUTO_REFRESH_MS = 30000;
 
     let settings = { defaultFailureThreshold: 2, panels: [] };
     let state = { lastRunAt: null, vps: {} };
     let selectedPanelId = null;
     let selectedStatusScope = "current";
     let eventPage = 1;
+    let autoRefreshTimer = null;
+    let liveRefreshInFlight = false;
 
     tokenInput.value = sessionStorage.getItem("adminToken") || "";
 
@@ -1454,10 +1457,56 @@ const APP_HTML = `<!doctype html>
         settings = await api("/api/settings");
         state = await api("/api/state");
         selectedPanelId = settings.panels[0]?.id || null;
+        syncSettingsFromState();
         render();
+        startAutoRefresh();
         setNotice(sideNotice, "已连接。");
       } catch (error) {
         setNotice(sideNotice, error.message, true);
+      }
+    }
+
+    function startAutoRefresh() {
+      if (autoRefreshTimer) {
+        clearInterval(autoRefreshTimer);
+      }
+
+      autoRefreshTimer = setInterval(refreshLiveState, AUTO_REFRESH_MS);
+    }
+
+    async function refreshLiveState() {
+      if (!tokenInput.value.trim() || liveRefreshInFlight) return;
+
+      liveRefreshInFlight = true;
+      try {
+        state = await api("/api/state");
+        syncSettingsFromState();
+        renderLiveData();
+      } catch (error) {
+        setNotice(sideNotice, error.message, true);
+      } finally {
+        liveRefreshInFlight = false;
+      }
+    }
+
+    function syncSettingsFromState() {
+      for (const panel of settings.panels || []) {
+        for (const vps of panel.vps || []) {
+          const row = (state.vps || {})[panel.id + ":" + vps.id];
+          if (!row?.checkedAt) continue;
+
+          if (!row.error) {
+            vps.status = Number.isFinite(row.status) ? row.status : row.online ? 1 : 0;
+            vps.ip = row.ip || vps.ip || "";
+            vps.hostname = row.hostname || vps.hostname || "";
+            vps.lastOnline = row.online;
+          }
+
+          vps.lastCheckedAt = row.checkedAt;
+          vps.failureCount = row.failureCount || 0;
+          vps.lastStartAttemptAt = row.lastStartAttemptAt || null;
+          vps.startCooldownUntil = row.startCooldownUntil || null;
+        }
       }
     }
 
@@ -1494,6 +1543,7 @@ const APP_HTML = `<!doctype html>
         const result = await api("/api/check-now", { method: "POST", body: "{}" });
         settings = await api("/api/settings");
         state = await api("/api/state");
+        syncSettingsFromState();
         render();
         setNotice(mainNotice, "检查完成，数量：" + result.checked);
       } catch (error) {
@@ -1552,10 +1602,15 @@ const APP_HTML = `<!doctype html>
       defaultFailureThreshold.value = settings.defaultFailureThreshold || 2;
       renderPanelList();
       renderPanelEditor();
+      renderEventFilters();
+      renderLiveData();
+    }
+
+    function renderLiveData() {
       renderStatusOverview();
       renderState();
-      renderEventFilters();
       renderEvents();
+      renderLiveVpsTable();
     }
 
     function renderPanelList() {
@@ -1628,14 +1683,14 @@ const APP_HTML = `<!doctype html>
                 <td><input class="switch" data-vps-field="enabled" data-vps-index="\${index}" type="checkbox" \${vps.enabled ? "checked" : ""}></td>
                 <td><input data-vps-field="name" data-vps-index="\${index}" value="\${escapeAttr(vps.name)}"></td>
                 <td>\${escapeHtml(vps.id)}</td>
-                <td>\${escapeHtml(vps.ip || "-")}</td>
-                <td>\${statusBadge(vps.status)}</td>
+                <td data-vps-live="ip" data-vps-key="\${escapeAttr(panel.id + ":" + vps.id)}">\${escapeHtml(getLiveVpsDisplay(panel, vps).ip)}</td>
+                <td data-vps-live="status" data-vps-key="\${escapeAttr(panel.id + ":" + vps.id)}">\${getLiveVpsDisplay(panel, vps).status}</td>
                 <td><input data-vps-field="cron" data-vps-index="\${index}" value="\${escapeAttr(vps.cron || "*/5 * * * *")}" placeholder="*/5 * * * *"></td>
                 <td><input class="switch" data-vps-field="autoStart" data-vps-index="\${index}" type="checkbox" \${vps.autoStart ? "checked" : ""}></td>
                 <td><input data-vps-field="failureThreshold" data-vps-index="\${index}" type="number" min="1" value="\${vps.failureThreshold || 2}"></td>
                 <td><input data-vps-field="startCooldownMinutes" data-vps-index="\${index}" type="number" min="1" value="\${vps.startCooldownMinutes || 15}"></td>
-                <td>\${vps.failureCount || 0}</td>
-                <td>\${escapeHtml(vps.lastCheckedAt || "-")}</td>
+                <td data-vps-live="failureCount" data-vps-key="\${escapeAttr(panel.id + ":" + vps.id)}">\${getLiveVpsDisplay(panel, vps).failureCount}</td>
+                <td data-vps-live="lastCheckedAt" data-vps-key="\${escapeAttr(panel.id + ":" + vps.id)}">\${escapeHtml(getLiveVpsDisplay(panel, vps).lastCheckedAt)}</td>
                 <td><button data-start-vps="\${escapeAttr(vps.id)}">启动</button></td>
               </tr>
             \`).join("")}
@@ -1646,6 +1701,37 @@ const APP_HTML = `<!doctype html>
       target.querySelectorAll("[data-start-vps]").forEach((button) => {
         button.addEventListener("click", () => startVps(panel.id, button.dataset.startVps));
       });
+    }
+
+    function renderLiveVpsTable() {
+      const panel = settings.panels.find((item) => item.id === selectedPanelId);
+      if (!panel) return;
+
+      const displays = new Map((panel.vps || []).map((vps) => {
+        return [panel.id + ":" + vps.id, getLiveVpsDisplay(panel, vps)];
+      }));
+
+      panelEditor.querySelectorAll("[data-vps-live][data-vps-key]").forEach((cell) => {
+        const display = displays.get(cell.dataset.vpsKey);
+        if (!display) return;
+
+        const value = display[cell.dataset.vpsLive];
+        if (cell.dataset.vpsLive === "status") {
+          cell.innerHTML = value;
+        } else {
+          cell.textContent = value;
+        }
+      });
+    }
+
+    function getLiveVpsDisplay(panel, vps) {
+      const row = (state.vps || {})[panel.id + ":" + vps.id];
+      return {
+        ip: row?.ip || vps.ip || "-",
+        status: row?.checkedAt ? monitorStatusBadge(row) : statusBadge(vps.status),
+        failureCount: row?.checkedAt ? row.failureCount || 0 : vps.failureCount || 0,
+        lastCheckedAt: row?.checkedAt || vps.lastCheckedAt || "-"
+      };
     }
 
     function renderStatusOverview() {
@@ -2063,6 +2149,14 @@ const APP_HTML = `<!doctype html>
       if (Number(status) === 1) return '<span class="badge ok">Online</span>';
       if (Number(status) === 0) return '<span class="badge down">Offline</span>';
       return '<span class="badge">Unknown</span>';
+    }
+
+    function monitorStatusBadge(row) {
+      if (row.error) return '<span class="badge down">Error</span>';
+      if (row.online) return '<span class="badge ok">Online</span>';
+      if (row.started) return '<span class="badge warn">Starting</span>';
+      if (row.startSuppressed) return '<span class="badge warn">Cooldown</span>';
+      return '<span class="badge down">Offline</span>';
     }
 
     function eventBadge(row) {
