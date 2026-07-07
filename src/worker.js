@@ -1502,7 +1502,14 @@ const APP_HTML = `<!doctype html>
     });
     defaultFailureThreshold.addEventListener("focusout", autoSaveSettings);
     panelEditor.addEventListener("focusout", (event) => {
-      if (event.target.matches("input, select, textarea")) {
+      if (event.target.matches("input:not([type='checkbox']):not([type='radio']), textarea")) {
+        autoSaveSettings();
+      }
+    });
+    panelEditor.addEventListener("change", (event) => {
+      if (event.target.matches("input[type='checkbox'], input[type='radio'], select")) {
+        collectPanelForm();
+        renderLiveData();
         autoSaveSettings();
       }
     });
