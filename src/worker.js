@@ -921,6 +921,69 @@ const APP_HTML = `<!doctype html>
     .notice.error {
       color: var(--danger);
     }
+    .message-root {
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      width: min(420px, calc(100vw - 32px));
+      pointer-events: none;
+      transform: translateX(-50%);
+    }
+    .message {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 280px;
+      max-width: 100%;
+      min-height: 40px;
+      padding: 9px 16px;
+      border: 1px solid #dcdfe6;
+      border-radius: 4px;
+      background: #f4f4f5;
+      color: #606266;
+      box-shadow: 0 4px 12px rgb(0 0 0 / 12%);
+      font-size: 14px;
+      line-height: 1.4;
+      animation: message-in 0.18s ease-out;
+    }
+    .message::before {
+      content: "";
+      flex: 0 0 auto;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .message.success {
+      border-color: #e1f3d8;
+      background: #f0f9eb;
+      color: #67c23a;
+    }
+    .message.error {
+      border-color: #fde2e2;
+      background: #fef0f0;
+      color: #f56c6c;
+    }
+    .message span {
+      min-width: 0;
+      color: #606266;
+      overflow-wrap: anywhere;
+    }
+    @keyframes message-in {
+      from {
+        opacity: 0;
+        transform: translateY(-12px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
     .empty {
       padding: 28px;
       text-align: center;
@@ -1266,6 +1329,7 @@ const APP_HTML = `<!doctype html>
   </style>
 </head>
 <body>
+  <div class="message-root" id="messageRoot" aria-live="polite"></div>
   <div class="shell">
     <aside>
       <div class="stack">
@@ -1374,6 +1438,7 @@ const APP_HTML = `<!doctype html>
 
   <script>
     const tokenInput = document.querySelector("#adminToken");
+    const messageRoot = document.querySelector("#messageRoot");
     const sideNotice = document.querySelector("#sideNotice");
     const mainNotice = document.querySelector("#mainNotice");
     const panelList = document.querySelector("#panelList");
@@ -1402,6 +1467,10 @@ const APP_HTML = `<!doctype html>
     let eventPage = 1;
     let autoRefreshTimer = null;
     let liveRefreshInFlight = false;
+    let settingsLoaded = false;
+    let autoSaveInFlight = false;
+    let autoSaveQueued = false;
+    let messageTimer = null;
 
     tokenInput.value = sessionStorage.getItem("adminToken") || "";
 
@@ -1431,6 +1500,12 @@ const APP_HTML = `<!doctype html>
         jumpEventPage();
       }
     });
+    defaultFailureThreshold.addEventListener("focusout", autoSaveSettings);
+    panelEditor.addEventListener("focusout", (event) => {
+      if (event.target.matches("input, select, textarea")) {
+        autoSaveSettings();
+      }
+    });
     document.querySelector("#clearRecentLogsBtn").addEventListener("click", () => clearLogs("recent"));
     document.querySelector("#clearImportantLogsBtn").addEventListener("click", () => clearLogs("important"));
 
@@ -1456,6 +1531,7 @@ const APP_HTML = `<!doctype html>
         setNotice(sideNotice, "读取中...");
         settings = await api("/api/settings");
         state = await api("/api/state");
+        settingsLoaded = true;
         selectedPanelId = settings.panels[0]?.id || null;
         syncSettingsFromState();
         render();
@@ -1512,13 +1588,44 @@ const APP_HTML = `<!doctype html>
 
     async function saveSettings() {
       try {
-        settings.defaultFailureThreshold = Number(defaultFailureThreshold.value || 2);
-        collectPanelForm();
-        settings = await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
-        render();
-        setNotice(mainNotice, "配置已保存。");
+        await persistSettings({ renderAfterSave: true, updateLocalSettings: true });
+        showMessage("配置已保存成功。", "success");
       } catch (error) {
-        setNotice(mainNotice, error.message, true);
+        showMessage("配置保存失败：" + error.message, "error");
+      }
+    }
+
+    async function autoSaveSettings() {
+      if (!settingsLoaded || !tokenInput.value.trim()) return;
+      if (autoSaveInFlight) {
+        autoSaveQueued = true;
+        return;
+      }
+
+      autoSaveInFlight = true;
+      try {
+        do {
+          autoSaveQueued = false;
+          await persistSettings({ renderAfterSave: false, updateLocalSettings: false });
+          showMessage("配置已自动保存成功。", "success");
+        } while (autoSaveQueued);
+      } catch (error) {
+        autoSaveQueued = false;
+        showMessage("自动保存失败：" + error.message, "error");
+      } finally {
+        autoSaveInFlight = false;
+      }
+    }
+
+    async function persistSettings({ renderAfterSave, updateLocalSettings }) {
+      settings.defaultFailureThreshold = Number(defaultFailureThreshold.value || 2);
+      collectPanelForm();
+      const savedSettings = await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
+      if (updateLocalSettings) {
+        settings = savedSettings;
+      }
+      if (renderAfterSave) {
+        render();
       }
     }
 
@@ -2190,6 +2297,23 @@ const APP_HTML = `<!doctype html>
     function setNotice(target, message, isError = false) {
       target.textContent = message;
       target.classList.toggle("error", isError);
+    }
+
+    function showMessage(message, type = "success") {
+      if (messageTimer) {
+        clearTimeout(messageTimer);
+      }
+
+      messageRoot.innerHTML = "";
+      const item = document.createElement("div");
+      item.className = "message " + type;
+      item.innerHTML = "<span>" + escapeHtml(message) + "</span>";
+      messageRoot.appendChild(item);
+
+      messageTimer = setTimeout(() => {
+        item.remove();
+        messageTimer = null;
+      }, 2200);
     }
 
     function escapeHtml(value) {
