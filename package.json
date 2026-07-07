@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "npx wrangler dev",
-    "deploy": "npx wrangler deploy"
+    "dev": "npx --yes wrangler@4.40.0 dev",
+    "deploy": "npx --yes wrangler@4.40.0 deploy"
   }
 }

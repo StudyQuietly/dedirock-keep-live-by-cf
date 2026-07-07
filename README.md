@@ -8,9 +8,10 @@ Cloudflare Workers 版 DediRock / Virtualizor VPS 保活工具。
 - 通过 Virtualizor End-user API 拉取 VPS 列表。
 - 支持按 VPS 开关监控、自动启动、独立 cron 表达式、离线阈值和启动防重时间。
 - Worker 每分钟唤醒一次，再按每台 VPS 的 cron 表达式判断是否检查。
+- 同一时间只允许一轮监控任务运行，并以有限并发检查 VPS，避免上一轮未结束时重复执行。
 - VPS 离线次数达到阈值后调用 Virtualizor `act=start`，启动防重时间内不会重复发送启动命令。
-- 每次检查后同步更新配置页中的 VPS 状态、IP、失败次数和检查时间。
-- 按每台 VPS 保留最近 100 条检查/启动事件日志，启动和错误日志会进入重要日志并长期保留。
+- 配置和运行状态分开保存：面板、密钥、策略保存在配置中，检查结果、失败次数、启动冷却和事件日志保存在运行状态中。
+- 按每台 VPS 保留最近 100 条普通事件日志；启动和错误日志会进入重要日志，重要日志同样按每台 VPS 保留最近 100 条。
 - 支持按日志等级、VPS 名称或关键字筛选日志，并支持清除最近日志或重要日志。
 - 提供前端配置页面，使用 `ADMIN_TOKEN` 保护管理 API。
 
@@ -42,12 +43,14 @@ Account Settings: Read
 4. 部署 Worker。
 5. 同步 `ADMIN_TOKEN` 到 Worker Secret。
 
+Actions 使用固定版本 `wrangler@4.40.0` 部署，避免 Wrangler 版本变化导致部署行为不一致。
+
 ### 手动部署
 
 1. 创建 KV：
 
 ```bash
-npx wrangler kv namespace create CONFIG
+npx --yes wrangler@4.40.0 kv namespace create CONFIG
 ```
 
 2. 把输出的 KV namespace id 写入 `wrangler.toml`：
@@ -61,13 +64,13 @@ id = "你的 KV namespace id"
 3. 设置管理 Token：
 
 ```bash
-npx wrangler secret put ADMIN_TOKEN
+npx --yes wrangler@4.40.0 secret put ADMIN_TOKEN
 ```
 
 4. 部署：
 
 ```bash
-npx wrangler deploy
+npx --yes wrangler@4.40.0 deploy
 ```
 
 ## 使用
@@ -82,7 +85,9 @@ npx wrangler deploy
 6. 为每台 VPS 配置 cron 表达式、离线阈值和启动防重分钟数，例如 `*/5 * * * *` 表示每 5 分钟检查一次。
 7. 保存配置。
 
-cron 使用 UTC 时间，支持 `*`、`*/n`、逗号和范围表达式。
+cron 使用 UTC 时间，支持 5 段表达式：分钟、小时、日期、月份、星期。支持 `*`、`*/n`、逗号、范围和范围步进，例如 `0-30/5 * * * *`。日期和星期字段采用同时满足语义；星期 `0` 和 `7` 都表示周日。保存配置时会校验 cron 表达式，非法表达式会返回错误，不会等到定时检查时才失败。
+
+Virtualizor 请求超时时间为 15 秒。超时、HTTP 错误、非 JSON 响应和 Virtualizor 业务错误都会记录到对应 VPS 的事件日志。
 
 ## Virtualizor API
 

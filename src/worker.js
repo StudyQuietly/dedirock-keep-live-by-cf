@@ -1,9 +1,13 @@
 const CONFIG_KEY = "settings";
 const STATE_KEY = "monitor-state";
 const START_LOCK_KEY_PREFIX = "start-lock:";
+const MONITOR_RUN_LOCK_KEY = "monitor-run-lock";
 const DEFAULT_VPS_CRON = "*/5 * * * *";
 const DEFAULT_START_COOLDOWN_MINUTES = 15;
 const MAX_EVENT_LOGS_PER_VPS = 100;
+const MONITOR_RUN_LOCK_TTL_SECONDS = 300;
+const MONITOR_CONCURRENCY = 5;
+const VIRTUALIZOR_REQUEST_TIMEOUT_MS = 15000;
 
 const DEFAULT_SETTINGS = {
   checkIntervalNote: "Worker wakes up every minute; each VPS controls its own cron schedule.",
@@ -81,7 +85,7 @@ export default {
 
       return jsonResponse({ error: "Not found" }, 404);
     } catch (error) {
-      return jsonResponse({ error: error.message || String(error) }, 500);
+      return jsonResponse({ error: error.message || String(error) }, error.status || 500);
     }
   },
 
@@ -91,89 +95,159 @@ export default {
 };
 
 async function runMonitor(env, options = {}) {
+  const lock = await acquireMonitorRunLock(env);
+  if (!lock.acquired) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "Monitor is already running",
+      checked: 0,
+      checks: [],
+      activeRun: lock.activeRun
+    };
+  }
+
+  try {
+    return await runMonitorChecks(env, options);
+  } finally {
+    await releaseMonitorRunLock(env, lock.owner);
+  }
+}
+
+async function runMonitorChecks(env, options = {}) {
   const settings = await getSettings(env);
   const state = await getState(env);
   const now = new Date();
-  const checks = [];
-  let settingsChanged = false;
+  const jobs = [];
 
   for (const panel of settings.panels.filter((item) => item.enabled)) {
     for (const vps of panel.vps.filter((item) => item.enabled)) {
-      const key = `${panel.id}:${vps.id}`;
-      const previous = state.vps[key] || {};
-      const result = {
-        panelId: panel.id,
-        panelName: panel.name,
-        vpsId: vps.id,
-        name: vps.name,
-        cron: vps.cron,
-        checkedAt: now.toISOString(),
-        online: false,
-        failureCount: previous.failureCount || 0,
-        started: false,
-        startSuppressed: false,
-        lastStartAttemptAt: previous.lastStartAttemptAt || null,
-        startCooldownUntil: previous.startCooldownUntil || null,
-        error: null
-      };
-
-      try {
-        if (!options.force && !isCronDue(vps.cron, now)) {
-          continue;
-        }
-
-        const info = await getVirtualizorVpsInfo(panel, vps.id);
-        result.online = isVpsOnline(info);
-        result.status = readVpsStatus(info);
-        result.ip = readVpsIp(info);
-        result.hostname = readVpsHostname(info) || vps.hostname;
-
-        if (result.online) {
-          result.failureCount = 0;
-          result.lastStartAttemptAt = null;
-          result.startCooldownUntil = null;
-          if (previous.lastStartAttemptAt || previous.startCooldownUntil) {
-            await clearStartLock(env, key);
-          }
-        } else {
-          result.failureCount += 1;
-          const threshold = Number(vps.failureThreshold || settings.defaultFailureThreshold || 2);
-          if (vps.autoStart && result.failureCount >= threshold) {
-            const startAttempt = await startVirtualizorVpsWithCooldown(env, panel, vps, now);
-            result.startSuppressed = startAttempt.startSuppressed;
-            result.lastStartAttemptAt = startAttempt.lastStartAttemptAt;
-            result.startCooldownUntil = startAttempt.startCooldownUntil;
-            if (startAttempt.started) {
-              result.startResult = startAttempt.startResult;
-              result.started = true;
-              result.failureCount = 0;
-            }
-          }
-        }
-      } catch (error) {
-        if (error.startAttempt) {
-          result.lastStartAttemptAt = error.startAttempt.lastStartAttemptAt;
-          result.startCooldownUntil = error.startAttempt.startCooldownUntil;
-        }
-        result.error = error.message || String(error);
-        result.failureCount += 1;
-      }
-
-      state.vps[key] = result;
-      appendMonitorEvent(state, result);
-      syncConfiguredVpsStatus(vps, result);
-      settingsChanged = true;
-      checks.push(result);
+      jobs.push(() => checkConfiguredVps(env, settings, state, panel, vps, now, options));
     }
+  }
+
+  const checks = (await runWithConcurrency(jobs, MONITOR_CONCURRENCY)).filter(Boolean);
+  for (const { key, result } of checks) {
+    state.vps[key] = result;
+    appendMonitorEvent(state, result);
   }
 
   state.lastRunAt = now.toISOString();
   await putJson(env, STATE_KEY, state);
-  if (settingsChanged) {
-    await putJson(env, CONFIG_KEY, settings);
+
+  return { ok: true, checked: checks.length, checks: checks.map((item) => item.result) };
+}
+
+async function checkConfiguredVps(env, settings, state, panel, vps, now, options) {
+  const key = `${panel.id}:${vps.id}`;
+  const previous = state.vps[key] || {};
+  const result = {
+    panelId: panel.id,
+    panelName: panel.name,
+    vpsId: vps.id,
+    name: vps.name,
+    cron: vps.cron,
+    checkedAt: now.toISOString(),
+    online: false,
+    failureCount: previous.failureCount || 0,
+    started: false,
+    startSuppressed: false,
+    lastStartAttemptAt: previous.lastStartAttemptAt || null,
+    startCooldownUntil: previous.startCooldownUntil || null,
+    error: null
+  };
+
+  try {
+    if (!options.force && !isCronDue(vps.cron, now)) {
+      return null;
+    }
+
+    const info = await getVirtualizorVpsInfo(panel, vps.id);
+    result.online = isVpsOnline(info);
+    result.status = readVpsStatus(info);
+    result.ip = readVpsIp(info);
+    result.hostname = readVpsHostname(info) || vps.hostname;
+
+    if (result.online) {
+      result.failureCount = 0;
+      result.lastStartAttemptAt = null;
+      result.startCooldownUntil = null;
+      if (previous.lastStartAttemptAt || previous.startCooldownUntil) {
+        await clearStartLock(env, key);
+      }
+    } else {
+      result.failureCount += 1;
+      const threshold = Number(vps.failureThreshold || settings.defaultFailureThreshold || 2);
+      if (vps.autoStart && result.failureCount >= threshold) {
+        const startAttempt = await startVirtualizorVpsWithCooldown(env, panel, vps, now);
+        result.startSuppressed = startAttempt.startSuppressed;
+        result.lastStartAttemptAt = startAttempt.lastStartAttemptAt;
+        result.startCooldownUntil = startAttempt.startCooldownUntil;
+        if (startAttempt.started) {
+          result.startResult = startAttempt.startResult;
+          result.started = true;
+          result.failureCount = 0;
+        }
+      }
+    }
+  } catch (error) {
+    if (error.startAttempt) {
+      result.lastStartAttemptAt = error.startAttempt.lastStartAttemptAt;
+      result.startCooldownUntil = error.startAttempt.startCooldownUntil;
+    }
+    result.error = error.message || String(error);
+    result.failureCount += 1;
   }
 
-  return { ok: true, checked: checks.length, checks };
+  return { key, result };
+}
+
+async function runWithConcurrency(jobs, concurrency) {
+  const results = new Array(jobs.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < jobs.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await jobs[index]();
+    }
+  }
+
+  const workerCount = Math.min(Math.max(1, concurrency), jobs.length);
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return results;
+}
+
+async function acquireMonitorRunLock(env) {
+  ensureKv(env);
+  const now = new Date();
+  const activeRun = await env.CONFIG.get(MONITOR_RUN_LOCK_KEY, "json");
+
+  if (activeRun?.expiresAt && new Date(activeRun.expiresAt) > now) {
+    return { acquired: false, activeRun };
+  }
+
+  const owner = crypto.randomUUID();
+  const lock = {
+    owner,
+    startedAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + MONITOR_RUN_LOCK_TTL_SECONDS * 1000).toISOString()
+  };
+
+  await env.CONFIG.put(MONITOR_RUN_LOCK_KEY, JSON.stringify(lock), {
+    expirationTtl: MONITOR_RUN_LOCK_TTL_SECONDS
+  });
+
+  return { acquired: true, owner };
+}
+
+async function releaseMonitorRunLock(env, owner) {
+  ensureKv(env);
+  const activeRun = await env.CONFIG.get(MONITOR_RUN_LOCK_KEY, "json");
+  if (activeRun?.owner === owner) {
+    await env.CONFIG.delete(MONITOR_RUN_LOCK_KEY);
+  }
 }
 
 async function refreshConfiguredVps(settings) {
@@ -187,13 +261,11 @@ async function refreshConfiguredVps(settings) {
       name: existing.get(String(item.id))?.name || item.name || item.hostname || `VPS ${item.id}`,
       hostname: item.hostname || "",
       ip: item.ip || "",
-      status: item.status,
       enabled: existing.get(String(item.id))?.enabled ?? true,
       autoStart: existing.get(String(item.id))?.autoStart ?? true,
       cron: existing.get(String(item.id))?.cron || DEFAULT_VPS_CRON,
       failureThreshold: existing.get(String(item.id))?.failureThreshold || settings.defaultFailureThreshold || 2,
-      startCooldownMinutes: existing.get(String(item.id))?.startCooldownMinutes || DEFAULT_START_COOLDOWN_MINUTES,
-      lastCheckedAt: existing.get(String(item.id))?.lastCheckedAt || null
+      startCooldownMinutes: existing.get(String(item.id))?.startCooldownMinutes || DEFAULT_START_COOLDOWN_MINUTES
     }));
 
     panels.push({ ...panel, vps: merged });
@@ -357,10 +429,19 @@ async function virtualizorRequest(panel, params) {
   url.searchParams.set("apikey", panel.apiKey);
   url.searchParams.set("apipass", panel.apiPass);
 
-  const response = await fetch(url.toString(), {
-    method: "GET",
-    headers: { Accept: "application/json" }
-  });
+  let response;
+  try {
+    response = await fetch(url.toString(), {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(VIRTUALIZOR_REQUEST_TIMEOUT_MS)
+    });
+  } catch (error) {
+    if (error.name === "TimeoutError" || error.name === "AbortError") {
+      throw new Error(`Virtualizor request timed out after ${VIRTUALIZOR_REQUEST_TIMEOUT_MS / 1000}s`);
+    }
+    throw error;
+  }
 
   const text = await response.text();
   if (!response.ok) {
@@ -425,8 +506,8 @@ async function putJson(env, key, value) {
 function normalizeSettings(input) {
   return {
     checkIntervalNote: DEFAULT_SETTINGS.checkIntervalNote,
-    defaultFailureThreshold: positiveInteger(input.defaultFailureThreshold, 2),
-    panels: Array.isArray(input.panels) ? input.panels.map(normalizePanel) : []
+    defaultFailureThreshold: positiveInteger(input?.defaultFailureThreshold, 2),
+    panels: Array.isArray(input?.panels) ? input.panels.map(normalizePanel) : []
   };
 }
 
@@ -449,25 +530,32 @@ function normalizeVps(input) {
     name: String(input.name || input.hostname || input.id || "VPS").trim(),
     hostname: String(input.hostname || "").trim(),
     ip: String(input.ip || "").trim(),
-    status: input.status === undefined ? null : Number(input.status),
     enabled: Boolean(input.enabled ?? true),
     autoStart: Boolean(input.autoStart ?? true),
-    cron: String(input.cron || DEFAULT_VPS_CRON).trim(),
+    cron: normalizeCronExpression(input.cron),
     failureThreshold: positiveInteger(input.failureThreshold, 2),
-    startCooldownMinutes: positiveInteger(input.startCooldownMinutes, DEFAULT_START_COOLDOWN_MINUTES),
-    lastCheckedAt: input.lastCheckedAt || null,
-    lastOnline: input.lastOnline === undefined ? null : Boolean(input.lastOnline),
-    failureCount: Number(input.failureCount || 0),
-    lastStartAttemptAt: input.lastStartAttemptAt || null,
-    startCooldownUntil: input.startCooldownUntil || null
+    startCooldownMinutes: positiveInteger(input.startCooldownMinutes, DEFAULT_START_COOLDOWN_MINUTES)
   };
 }
 
 function normalizeBaseUrl(value) {
   const trimmed = String(value || "").trim().replace(/\/+$/, "");
   if (!trimmed) return "";
-  const url = new URL(trimmed);
-  return `${url.protocol}//${url.host}`;
+  try {
+    const url = new URL(trimmed);
+    if (!["http:", "https:"].includes(url.protocol)) {
+      throw new Error("Virtualizor panel URL must use http or https");
+    }
+    return `${url.protocol}//${url.host}`;
+  } catch (error) {
+    throw httpError(400, `Invalid Virtualizor panel URL: ${trimmed}`);
+  }
+}
+
+function normalizeCronExpression(value) {
+  const expression = String(value || DEFAULT_VPS_CRON).trim();
+  validateCronExpression(expression);
+  return expression;
 }
 
 function positiveInteger(value, fallback) {
@@ -483,20 +571,6 @@ function findConfiguredVps(settings, panelId, vpsId) {
   if (!vps) throw new Error("VPS not found");
 
   return { panel, vps };
-}
-
-function syncConfiguredVpsStatus(vps, result) {
-  if (!result.error) {
-    vps.status = Number.isFinite(result.status) ? result.status : null;
-    vps.ip = result.ip || vps.ip || "";
-    vps.hostname = result.hostname || vps.hostname || "";
-    vps.lastOnline = result.online;
-  }
-
-  vps.lastCheckedAt = result.checkedAt;
-  vps.failureCount = result.failureCount || 0;
-  vps.lastStartAttemptAt = result.lastStartAttemptAt || null;
-  vps.startCooldownUntil = result.startCooldownUntil || null;
 }
 
 function appendMonitorEvent(state, result) {
@@ -526,7 +600,7 @@ function appendMonitorEvent(state, result) {
 
   state.events = limitEventsPerVps([event, ...(Array.isArray(state.events) ? state.events : [])], MAX_EVENT_LOGS_PER_VPS);
   if (important) {
-    state.importantEvents = [event, ...(Array.isArray(state.importantEvents) ? state.importantEvents : [])];
+    state.importantEvents = limitEventsPerVps([event, ...(Array.isArray(state.importantEvents) ? state.importantEvents : [])], MAX_EVENT_LOGS_PER_VPS);
   }
 }
 
@@ -546,12 +620,16 @@ function limitEventsPerVps(events, maxPerVps) {
   return limited;
 }
 
-function isCronDue(expression, date) {
-  const parts = String(expression || DEFAULT_VPS_CRON).trim().split(/\s+/);
-  if (parts.length !== 5) {
-    throw new Error(`Invalid cron expression: ${expression}`);
+function validateCronExpression(expression) {
+  try {
+    parseCronExpression(expression);
+  } catch (error) {
+    throw httpError(400, `Invalid cron expression: ${expression}`);
   }
+}
 
+function isCronDue(expression, date) {
+  const fields = parseCronExpression(expression);
   const values = [
     date.getUTCMinutes(),
     date.getUTCHours(),
@@ -559,6 +637,15 @@ function isCronDue(expression, date) {
     date.getUTCMonth() + 1,
     date.getUTCDay()
   ];
+  return fields.every((field, index) => field.has(normalizeCronValue(values[index], index === 4)));
+}
+
+function parseCronExpression(expression) {
+  const parts = String(expression || DEFAULT_VPS_CRON).trim().split(/\s+/);
+  if (parts.length !== 5) {
+    throw new Error(`Invalid cron expression: ${expression}`);
+  }
+
   const ranges = [
     [0, 59],
     [0, 23],
@@ -567,40 +654,58 @@ function isCronDue(expression, date) {
     [0, 7]
   ];
 
-  return parts.every((part, index) => matchCronField(part, values[index], ranges[index][0], ranges[index][1], index === 4));
+  return parts.map((part, index) => parseCronField(part, ranges[index][0], ranges[index][1], index === 4));
 }
 
-function matchCronField(field, value, min, max, isDayOfWeek = false) {
-  return field.split(",").some((segment) => matchCronSegment(segment.trim(), value, min, max, isDayOfWeek));
+function parseCronField(field, min, max, isDayOfWeek = false) {
+  const values = new Set();
+  for (const segment of field.split(",")) {
+    for (const value of parseCronSegment(segment.trim(), min, max, isDayOfWeek)) {
+      values.add(value);
+    }
+  }
+
+  return values;
 }
 
-function matchCronSegment(segment, value, min, max, isDayOfWeek) {
-  if (!segment) return false;
+function parseCronSegment(segment, min, max, isDayOfWeek) {
+  if (!segment) throw new Error("Empty cron segment");
 
-  const [base, stepText] = segment.split("/");
+  const stepParts = segment.split("/");
+  if (stepParts.length > 2) throw new Error("Invalid cron step");
+
+  const [base, stepText] = stepParts;
   const step = stepText === undefined ? 1 : Number(stepText);
-  if (!Number.isInteger(step) || step < 1) return false;
+  if (!Number.isInteger(step) || step < 1) throw new Error("Invalid cron step");
 
   let start = min;
   let end = max;
 
   if (base !== "*") {
     if (base.includes("-")) {
-      const [rangeStart, rangeEnd] = base.split("-").map(Number);
-      start = normalizeCronValue(rangeStart, isDayOfWeek);
-      end = normalizeCronValue(rangeEnd, isDayOfWeek);
+      const rangeParts = base.split("-");
+      if (rangeParts.length !== 2) throw new Error("Invalid cron range");
+
+      const [rangeStart, rangeEnd] = rangeParts.map(Number);
+      start = rangeStart;
+      end = rangeEnd;
     } else {
-      start = normalizeCronValue(Number(base), isDayOfWeek);
+      start = Number(base);
       end = start;
     }
   }
 
-  const normalizedValue = normalizeCronValue(value, isDayOfWeek);
-  if (!Number.isInteger(start) || !Number.isInteger(end)) return false;
-  if (start < min || end > max || start > end) return false;
-  if (normalizedValue < start || normalizedValue > end) return false;
+  if (!Number.isInteger(start) || !Number.isInteger(end)) throw new Error("Invalid cron range");
+  if (start < min || end > max || start > end) throw new Error("Invalid cron range");
 
-  return (normalizedValue - start) % step === 0;
+  const values = [];
+  for (let value = start; value <= end; value += 1) {
+    if ((value - start) % step === 0) {
+      values.push(normalizeCronValue(value, isDayOfWeek));
+    }
+  }
+
+  return values;
 }
 
 function normalizeCronValue(value, isDayOfWeek) {
@@ -652,6 +757,12 @@ function requireAdmin(request, env) {
   }
 
   return null;
+}
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
 }
 
 function jsonResponse(data, status = 200) {
@@ -1580,8 +1691,6 @@ const APP_HTML = `<!doctype html>
 
           if (!row.error) {
             vps.status = Number.isFinite(row.status) ? row.status : row.online ? 1 : 0;
-            vps.ip = row.ip || vps.ip || "";
-            vps.hostname = row.hostname || vps.hostname || "";
             vps.lastOnline = row.online;
           }
 
