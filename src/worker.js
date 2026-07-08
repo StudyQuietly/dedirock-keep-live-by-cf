@@ -1334,6 +1334,23 @@ const APP_HTML = `<!doctype html>
       gap: 10px;
       flex-wrap: wrap;
     }
+    .event-controls {
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }
+    .event-controls select,
+    .event-controls input,
+    .event-controls button {
+      flex: 0 0 auto;
+    }
+    .event-controls select {
+      width: 180px;
+      min-width: 150px;
+    }
+    .event-controls input {
+      width: 260px;
+    }
     .between {
       display: flex;
       align-items: center;
@@ -1438,6 +1455,7 @@ const APP_HTML = `<!doctype html>
       position: sticky;
       top: 0;
       z-index: 1;
+      user-select: none;
     }
     .event-log-table th,
     .event-log-table td {
@@ -1445,6 +1463,59 @@ const APP_HTML = `<!doctype html>
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+    .event-log-table th[data-col-index] {
+      position: sticky;
+      padding-right: 16px;
+    }
+    .event-cell-text {
+      display: block;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .column-resizer {
+      position: absolute;
+      top: 0;
+      right: -3px;
+      z-index: 2;
+      width: 8px;
+      height: 100%;
+      cursor: col-resize;
+      touch-action: none;
+    }
+    .column-resizer::after {
+      content: "";
+      position: absolute;
+      top: 8px;
+      bottom: 8px;
+      left: 3px;
+      width: 1px;
+      background: transparent;
+    }
+    .column-resizer:hover::after,
+    body.column-resizing .column-resizer::after {
+      background: #9fb0c8;
+    }
+    .overflow-tooltip {
+      position: fixed;
+      z-index: 1000;
+      max-width: min(520px, calc(100vw - 32px));
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: #172033;
+      color: #f8fafc;
+      font-size: 13px;
+      line-height: 1.45;
+      box-shadow: 0 12px 28px rgb(23 32 51 / 24%);
+      overflow-wrap: anywhere;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity .08s ease;
+    }
+    .overflow-tooltip.active {
+      opacity: 1;
     }
     th, td {
       border-bottom: 1px solid var(--line);
@@ -1997,7 +2068,7 @@ const APP_HTML = `<!doctype html>
           <h2>事件日志</h2>
           <span class="muted">每台 VPS 保留最近 100 条</span>
         </div>
-        <div class="row">
+        <div class="row event-controls">
           <select id="eventLogType">
             <option value="recent">最近日志</option>
             <option value="important">重要日志</option>
@@ -2011,7 +2082,7 @@ const APP_HTML = `<!doctype html>
           <select id="eventVpsFilter">
             <option value="all">全部 VPS</option>
           </select>
-          <input id="eventSearch" style="max-width: 260px;" placeholder="搜索 VPS、名称、错误">
+          <input id="eventSearch" placeholder="搜索 VPS、名称、错误">
           <button id="clearRecentLogsBtn">清除最近</button>
           <button id="clearImportantLogsBtn" class="danger">清除重要</button>
         </div>
@@ -2062,18 +2133,36 @@ const APP_HTML = `<!doctype html>
     const notificationEvents = document.querySelector("#notificationEvents");
     const notificationChannels = document.querySelector("#notificationChannels");
     const AUTO_REFRESH_MS = 30000;
+    const EVENT_COLUMNS = [
+      { label: "时间", width: 190, minWidth: 130 },
+      { label: "等级", width: 110, minWidth: 82 },
+      { label: "类型", width: 120, minWidth: 88 },
+      { label: "面板", width: 170, minWidth: 110 },
+      { label: "VPS", width: 170, minWidth: 110 },
+      { label: "状态", width: 110, minWidth: 88 },
+      { label: "失败次数", width: 120, minWidth: 96 },
+      { label: "启动结果", width: 170, minWidth: 110 },
+      { label: "通知", width: 170, minWidth: 110 },
+      { label: "错误", width: 240, minWidth: 140 }
+    ];
 
     let settings = { defaultFailureThreshold: 2, notifications: defaultNotifications(), panels: [] };
     let state = { lastRunAt: null, vps: {} };
     let selectedPanelId = null;
     let selectedStatusScope = "current";
     let eventPage = 1;
+    let eventColumnWidths = EVENT_COLUMNS.map((column) => column.width);
+    let eventColumnResize = null;
+    let overflowTooltipTarget = null;
     let autoRefreshTimer = null;
     let liveRefreshInFlight = false;
     let settingsLoaded = false;
     let autoSaveInFlight = false;
     let autoSaveQueued = false;
     let messageTimer = null;
+    const overflowTooltip = document.createElement("div");
+    overflowTooltip.className = "overflow-tooltip";
+    document.body.appendChild(overflowTooltip);
 
     tokenInput.value = sessionStorage.getItem("adminToken") || "";
 
@@ -2099,6 +2188,10 @@ const APP_HTML = `<!doctype html>
     eventVpsFilter.addEventListener("change", resetEventPageAndRender);
     eventPageSize.addEventListener("change", resetEventPageAndRender);
     eventSearch.addEventListener("input", resetEventPageAndRender);
+    eventTable.addEventListener("pointerdown", startEventColumnResize);
+    eventTable.addEventListener("mouseover", handleEventCellTooltip);
+    eventTable.addEventListener("mousemove", moveOverflowTooltip);
+    eventTable.addEventListener("mouseout", hideEventCellTooltip);
     eventPageJumpBtn.addEventListener("click", jumpEventPage);
     eventPageJump.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
@@ -2940,6 +3033,129 @@ const APP_HTML = `<!doctype html>
       renderEvents();
     }
 
+    function getEventTableWidth() {
+      return eventColumnWidths.reduce((sum, width) => sum + width, 0);
+    }
+
+    function renderEventColgroup() {
+      return "<colgroup>" + EVENT_COLUMNS.map((column, index) => (
+        '<col data-event-col="' + index + '" style="width: ' + eventColumnWidths[index] + 'px">'
+      )).join("") + "</colgroup>";
+    }
+
+    function renderEventHeader() {
+      return "<thead><tr>" + EVENT_COLUMNS.map((column, index) => (
+        '<th data-col-index="' + index + '">' +
+          escapeHtml(column.label) +
+          '<span class="column-resizer" data-col-index="' + index + '" aria-hidden="true"></span>' +
+        '</th>'
+      )).join("") + "</tr></thead>";
+    }
+
+    function eventTextCell(value) {
+      const text = String(value ?? "-");
+      return '<td><span class="event-cell-text" data-overflow-text="' + escapeAttr(text) + '">' + escapeHtml(text) + '</span></td>';
+    }
+
+    function applyEventColumnWidths() {
+      const table = eventTable.querySelector(".event-log-table");
+      if (!table) return;
+
+      table.style.minWidth = getEventTableWidth() + "px";
+      table.querySelectorAll("col[data-event-col]").forEach((column) => {
+        const index = Number(column.dataset.eventCol);
+        column.style.width = eventColumnWidths[index] + "px";
+      });
+    }
+
+    function startEventColumnResize(event) {
+      const resizer = event.target.closest(".column-resizer");
+      if (!resizer || !eventTable.contains(resizer)) return;
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+
+      const index = Number(resizer.dataset.colIndex);
+      if (!Number.isInteger(index)) return;
+
+      hideOverflowTooltip();
+      event.preventDefault();
+      eventColumnResize = {
+        index,
+        startX: event.clientX,
+        startWidth: eventColumnWidths[index],
+        resizer
+      };
+      document.body.classList.add("column-resizing");
+      resizer.setPointerCapture?.(event.pointerId);
+      document.addEventListener("pointermove", resizeEventColumn);
+      document.addEventListener("pointerup", stopEventColumnResize, { once: true });
+      document.addEventListener("pointercancel", stopEventColumnResize, { once: true });
+    }
+
+    function resizeEventColumn(event) {
+      if (!eventColumnResize) return;
+
+      const column = EVENT_COLUMNS[eventColumnResize.index];
+      const minWidth = column?.minWidth || 80;
+      eventColumnWidths[eventColumnResize.index] = Math.max(minWidth, eventColumnResize.startWidth + event.clientX - eventColumnResize.startX);
+      applyEventColumnWidths();
+    }
+
+    function stopEventColumnResize() {
+      if (!eventColumnResize) return;
+
+      document.body.classList.remove("column-resizing");
+      document.removeEventListener("pointermove", resizeEventColumn);
+      eventColumnResize = null;
+    }
+
+    function handleEventCellTooltip(event) {
+      const target = event.target.closest("[data-overflow-text]");
+      if (!target || !eventTable.contains(target)) return;
+      if (!isOverflowed(target)) {
+        hideOverflowTooltip();
+        return;
+      }
+
+      overflowTooltipTarget = target;
+      overflowTooltip.textContent = target.dataset.overflowText || target.textContent || "";
+      overflowTooltip.classList.add("active");
+      moveOverflowTooltip(event);
+    }
+
+    function moveOverflowTooltip(event) {
+      if (!overflowTooltipTarget) return;
+
+      const gap = 12;
+      const width = overflowTooltip.offsetWidth;
+      const height = overflowTooltip.offsetHeight;
+      let left = event.clientX + gap;
+      let top = event.clientY + gap;
+
+      if (left + width > window.innerWidth - gap) {
+        left = Math.max(gap, window.innerWidth - width - gap);
+      }
+      if (top + height > window.innerHeight - gap) {
+        top = Math.max(gap, event.clientY - height - gap);
+      }
+
+      overflowTooltip.style.left = left + "px";
+      overflowTooltip.style.top = top + "px";
+    }
+
+    function hideEventCellTooltip(event) {
+      if (!overflowTooltipTarget || overflowTooltipTarget.contains(event.relatedTarget)) return;
+      hideOverflowTooltip();
+    }
+
+    function hideOverflowTooltip() {
+      overflowTooltipTarget = null;
+      overflowTooltip.classList.remove("active");
+    }
+
+    function isOverflowed(element) {
+      return element.scrollWidth > element.clientWidth || element.scrollHeight > element.clientHeight;
+    }
+
     function renderEvents() {
       const source = eventLogType.value === "important" ? state.importantEvents || [] : state.events || [];
       const level = eventLevelFilter.value;
@@ -2978,21 +3194,22 @@ const APP_HTML = `<!doctype html>
 
       eventTable.innerHTML = \`
         <div class="event-table-scroll">
-          <table class="table event-log-table">
-          <thead><tr><th>时间</th><th>等级</th><th>类型</th><th>面板</th><th>VPS</th><th>状态</th><th>失败次数</th><th>启动结果</th><th>通知</th><th>错误</th></tr></thead>
+          <table class="table event-log-table" style="min-width: \${getEventTableWidth()}px;">
+          \${renderEventColgroup()}
+          \${renderEventHeader()}
           <tbody>
             \${pageRows.map((row) => \`
               <tr>
-                <td>\${escapeHtml(row.at || "-")}</td>
+                \${eventTextCell(row.at || "-")}
                 <td>\${levelBadge(row.level)}</td>
                 <td>\${eventBadge(row)}</td>
-                <td>\${escapeHtml(row.panelName || row.panelId)}</td>
-                <td>\${escapeHtml(row.name || row.vpsId)}</td>
+                \${eventTextCell(row.panelName || row.panelId)}
+                \${eventTextCell(row.name || row.vpsId)}
                 <td>\${row.online ? '<span class="badge ok">Online</span>' : '<span class="badge down">Offline</span>'}</td>
-                <td>\${row.failureCount || 0}</td>
-                <td>\${escapeHtml(summarizeStartResult(row.startResult))}</td>
-                <td>\${escapeHtml(summarizeNotificationResults(row.notificationResults))}</td>
-                <td>\${escapeHtml(row.error || "-")}</td>
+                \${eventTextCell(row.failureCount || 0)}
+                \${eventTextCell(summarizeStartResult(row.startResult))}
+                \${eventTextCell(summarizeNotificationResults(row.notificationResults))}
+                \${eventTextCell(row.error || "-")}
               </tr>
             \`).join("")}
           </tbody>
@@ -3000,6 +3217,7 @@ const APP_HTML = `<!doctype html>
         </div>
       \`;
 
+      applyEventColumnWidths();
       renderEventPagination(totalPages);
     }
 
