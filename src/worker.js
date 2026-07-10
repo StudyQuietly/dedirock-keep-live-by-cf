@@ -1310,6 +1310,12 @@ const APP_HTML = `<!doctype html>
       overflow-x: hidden;
       padding: 24px;
     }
+    main.stack {
+      align-content: start;
+    }
+    [hidden] {
+      display: none !important;
+    }
     h1 {
       margin: 0 0 4px;
       font-size: 22px;
@@ -1359,6 +1365,38 @@ const APP_HTML = `<!doctype html>
       min-width: 0;
       flex-wrap: wrap;
     }
+    .top-nav {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      align-self: start;
+      gap: 8px;
+      min-width: 0;
+      overflow-x: auto;
+      padding: 6px 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgb(255 255 255 / 95%);
+      box-shadow: 0 8px 20px rgb(23 32 51 / 6%);
+      backdrop-filter: blur(10px);
+    }
+    .top-nav button {
+      flex: 0 0 auto;
+      min-height: 32px;
+      padding: 0 10px;
+      border-color: transparent;
+      background: transparent;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .top-nav button.active {
+      border-color: var(--primary);
+      background: var(--primary-soft);
+      color: var(--primary);
+      box-shadow: 0 1px 3px rgb(23 32 51 / 10%);
+    }
     .card {
       min-width: 0;
       background: var(--panel);
@@ -1375,7 +1413,13 @@ const APP_HTML = `<!doctype html>
     .notification-events {
       display: flex;
       flex-wrap: wrap;
-      gap: 10px 16px;
+      gap: 8px 14px;
+    }
+    .notification-settings {
+      gap: 12px;
+    }
+    .notification-settings .grid {
+      gap: 10px 12px;
     }
     .notification-events label {
       display: inline-flex;
@@ -1389,15 +1433,18 @@ const APP_HTML = `<!doctype html>
     }
     .notification-channels {
       display: grid;
-      gap: 12px;
+      gap: 10px;
     }
     .notification-channel {
       display: grid;
-      gap: 12px;
-      padding: 12px;
+      gap: 10px;
+      padding: 10px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: #fafbfe;
+    }
+    .notification-channel .grid {
+      gap: 10px 12px;
     }
     .panel-list {
       display: grid;
@@ -1847,9 +1894,9 @@ const APP_HTML = `<!doctype html>
       display: flex;
       align-items: center;
       justify-content: flex-end;
-      gap: 12px;
-      margin-top: 14px;
-      padding-top: 12px;
+      gap: 8px;
+      margin-top: 10px;
+      padding-top: 8px;
       color: var(--text);
       flex-wrap: wrap;
     }
@@ -1857,8 +1904,10 @@ const APP_HTML = `<!doctype html>
       display: none;
     }
     .pagination-size {
+      flex: 0 0 132px;
+      width: 132px;
       min-width: 132px;
-      height: 40px;
+      height: 36px;
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 0 34px 0 12px;
@@ -1878,8 +1927,8 @@ const APP_HTML = `<!doctype html>
       min-width: 0;
     }
     .pagination button {
-      min-width: 40px;
-      height: 40px;
+      min-width: 36px;
+      height: 36px;
       border-color: transparent;
       border-radius: 8px;
       padding: 0 10px;
@@ -1920,8 +1969,8 @@ const APP_HTML = `<!doctype html>
       font-size: 14px;
     }
     .pagination-jumper input {
-      width: 82px;
-      height: 40px;
+      width: 76px;
+      height: 36px;
       text-align: center;
       font-size: 14px;
     }
@@ -1993,10 +2042,17 @@ const APP_HTML = `<!doctype html>
     </aside>
 
     <main class="stack">
-      <section class="card stack">
+      <nav class="top-nav" id="mainNav" aria-label="一级导航">
+        <button class="active" type="button" data-main-view="overview" aria-current="page">总览</button>
+        <button type="button" data-main-view="manage">管理</button>
+        <button type="button" data-main-view="logs">日志</button>
+        <button type="button" data-main-view="settings">通知设置</button>
+      </nav>
+
+      <section class="card stack" data-main-view-panel="manage">
         <div class="between">
           <div>
-            <h2>全局操作</h2>
+            <h2>快捷操作</h2>
             <div class="muted">Cron 会按 wrangler.toml 里的频率执行。</div>
           </div>
           <div class="row">
@@ -2006,14 +2062,10 @@ const APP_HTML = `<!doctype html>
             <button class="primary" id="saveBtn">保存配置</button>
           </div>
         </div>
-        <label style="max-width: 240px;">
-          默认离线阈值
-          <input id="defaultFailureThreshold" type="number" min="1" step="1">
-        </label>
         <div class="notice" id="mainNotice"></div>
       </section>
 
-      <section class="card stack">
+      <section class="card stack notification-settings" data-main-view-panel="settings">
         <div class="between">
           <div>
             <h2>通知设置</h2>
@@ -2025,6 +2077,10 @@ const APP_HTML = `<!doctype html>
           </div>
         </div>
         <div class="grid">
+          <label>
+            默认离线阈值
+            <input id="defaultFailureThreshold" type="number" min="1" step="1">
+          </label>
           <label class="row" style="gap: 6px; color: var(--muted);">
             <input class="switch" id="notificationsEnabled" type="checkbox">启用通知
           </label>
@@ -2041,11 +2097,11 @@ const APP_HTML = `<!doctype html>
         <div class="notification-channels" id="notificationChannels"></div>
       </section>
 
-      <section class="card stack">
+      <section class="card stack" data-main-view-panel="overview">
         <div class="between">
           <h2>状态总览</h2>
           <div class="row">
-            <span class="muted">仅管理页可见</span>
+            <span class="muted">按范围查看</span>
             <div class="segmented" id="statusOverviewScope">
               <button class="active" type="button" data-status-scope="current">当前面板</button>
               <button type="button" data-status-scope="all">所有面板</button>
@@ -2055,15 +2111,15 @@ const APP_HTML = `<!doctype html>
         <div id="statusOverview"></div>
       </section>
 
-      <section class="card stack" id="panelEditor"></section>
-      <section class="card stack">
+      <section class="card stack" id="panelEditor" data-main-view-panel="manage"></section>
+      <section class="card stack" data-main-view-panel="overview">
         <div class="between">
           <h2>最近状态</h2>
           <span class="muted" id="lastRunAt">未检查</span>
         </div>
         <div id="stateTable"></div>
       </section>
-      <section class="card stack">
+      <section class="card stack" data-main-view-panel="logs">
         <div class="between">
           <h2>事件日志</h2>
           <span class="muted">每台 VPS 保留最近 100 条</span>
@@ -2109,6 +2165,8 @@ const APP_HTML = `<!doctype html>
   <script>
     const tokenInput = document.querySelector("#adminToken");
     const messageRoot = document.querySelector("#messageRoot");
+    const mainNav = document.querySelector("#mainNav");
+    const viewPanels = document.querySelectorAll("[data-main-view-panel]");
     const sideNotice = document.querySelector("#sideNotice");
     const mainNotice = document.querySelector("#mainNotice");
     const panelList = document.querySelector("#panelList");
@@ -2150,6 +2208,7 @@ const APP_HTML = `<!doctype html>
     let state = { lastRunAt: null, vps: {} };
     let selectedPanelId = null;
     let selectedStatusScope = "current";
+    let activeMainView = "overview";
     let eventPage = 1;
     let eventColumnWidths = EVENT_COLUMNS.map((column) => column.width);
     let eventColumnResize = null;
@@ -2175,6 +2234,9 @@ const APP_HTML = `<!doctype html>
     document.querySelector("#addPanelBtn").addEventListener("click", addPanel);
     document.querySelector("#refreshBtn").addEventListener("click", refreshVps);
     document.querySelector("#checkBtn").addEventListener("click", checkNow);
+    mainNav.querySelectorAll("[data-main-view]").forEach((button) => {
+      button.addEventListener("click", () => setMainView(button.dataset.mainView));
+    });
     document.querySelector("#addNotificationChannelBtn").addEventListener("click", addNotificationChannel);
     document.querySelector("#testAllNotificationsBtn").addEventListener("click", () => testNotifications(null));
     statusOverviewScope.querySelectorAll("[data-status-scope]").forEach((button) => {
@@ -2228,6 +2290,35 @@ const APP_HTML = `<!doctype html>
     });
     document.querySelector("#clearRecentLogsBtn").addEventListener("click", () => clearLogs("recent"));
     document.querySelector("#clearImportantLogsBtn").addEventListener("click", () => clearLogs("important"));
+    applyMainView();
+
+    function setMainView(view) {
+      activeMainView = view;
+      applyMainView();
+
+      if (view === "logs") {
+        renderEvents();
+      }
+      if (view === "overview") {
+        renderStatusOverview();
+        renderState();
+      }
+    }
+
+    function applyMainView() {
+      mainNav.querySelectorAll("[data-main-view]").forEach((button) => {
+        const active = button.dataset.mainView === activeMainView;
+        button.classList.toggle("active", active);
+        if (active) {
+          button.setAttribute("aria-current", "page");
+        } else {
+          button.removeAttribute("aria-current");
+        }
+      });
+      viewPanels.forEach((panel) => {
+        panel.hidden = panel.dataset.mainViewPanel !== activeMainView;
+      });
+    }
 
     function authHeaders() {
       return {
@@ -2617,6 +2708,7 @@ const APP_HTML = `<!doctype html>
       settings.panels.push(panel);
       selectedPanelId = panel.id;
       render();
+      setMainView("manage");
     }
 
     function removePanel(id) {
@@ -2633,6 +2725,7 @@ const APP_HTML = `<!doctype html>
       renderPanelEditor();
       renderEventFilters();
       renderLiveData();
+      applyMainView();
     }
 
     function renderLiveData() {
