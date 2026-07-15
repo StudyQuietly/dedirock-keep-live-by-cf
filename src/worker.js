@@ -12,6 +12,7 @@ const VIRTUALIZOR_REQUEST_TIMEOUT_MS = 15000;
 const DEFAULT_SETTINGS = {
   checkIntervalNote: "Worker wakes up every minute; each VPS controls its own cron schedule.",
   defaultFailureThreshold: 2,
+  timezone: "local",
   notifications: {
     enabled: false,
     events: {
@@ -534,10 +535,38 @@ async function putJson(env, key, value) {
   await env.CONFIG.put(key, JSON.stringify(value, null, 2));
 }
 
+function formatDateTimeWithTimezone(value, timezone) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "-";
+  const tz = (timezone && timezone !== "local") ? timezone : "Asia/Shanghai";
+  try {
+    const options = {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+      timeZone: tz
+    };
+    const formatter = new Intl.DateTimeFormat("zh-CN", options);
+    const parts = formatter.formatToParts(date);
+    const partMap = {};
+    for (const part of parts) {
+      partMap[part.type] = part.value;
+    }
+    return `${partMap.year}-${partMap.month}-${partMap.day} ${partMap.hour}:${partMap.minute}:${partMap.second}`;
+  } catch (e) {
+    return date.toISOString();
+  }
+}
+
 function normalizeSettings(input) {
   return {
     checkIntervalNote: DEFAULT_SETTINGS.checkIntervalNote,
     defaultFailureThreshold: positiveInteger(input?.defaultFailureThreshold, 2),
+    timezone: typeof input?.timezone === "string" ? input.timezone : "local",
     notifications: normalizeNotifications(input?.notifications),
     panels: Array.isArray(input?.panels) ? input.panels.map(normalizePanel) : []
   };
@@ -754,7 +783,7 @@ async function sendNotificationsForEvent(settings, state, event, previous) {
     return [];
   }
 
-  const message = buildNotificationMessage(event, notificationType);
+  const message = buildNotificationMessage(event, notificationType, settings.timezone);
   const results = await Promise.all(channels.map((channel) => sendNotificationChannel(channel, message, event)));
   updateNotificationState(state, event, notificationType);
   return results;
@@ -862,13 +891,13 @@ async function sendTestNotification(settings, channelId) {
   };
   const message = {
     title: "VPS 通知测试",
-    content: ["这是一条测试通知。", `时间：${now}`].join("\n")
+    content: ["这是一条测试通知。", `时间：${formatDateTimeWithTimezone(now, settings.timezone)}`].join("\n")
   };
   const results = await Promise.all(channels.map((channel) => sendNotificationChannel(channel, message, event)));
   return { ok: results.every((item) => item.ok), results };
 }
 
-function buildNotificationMessage(event, notificationType) {
+function buildNotificationMessage(event, notificationType, timezone) {
   const titleMap = {
     offline: "VPS 离线",
     start: "VPS 启动命令成功",
@@ -881,14 +910,14 @@ function buildNotificationMessage(event, notificationType) {
     `VPS ID：${event.vpsId}`,
     `状态：${event.error ? "Error" : event.online ? "Online" : "Offline"}`,
     `失败次数：${event.failureCount || 0}`,
-    `时间：${event.at}`
+    `时间：${formatDateTimeWithTimezone(event.at, timezone)}`
   ];
 
   if (event.error) {
     lines.push(`错误：${event.error}`);
   }
   if (event.startCooldownUntil) {
-    lines.push(`启动防重至：${event.startCooldownUntil}`);
+    lines.push(`启动防重至：${formatDateTimeWithTimezone(event.startCooldownUntil, timezone)}`);
   }
 
   return {
@@ -2046,7 +2075,7 @@ const APP_HTML = `<!doctype html>
         <button class="active" type="button" data-main-view="overview" aria-current="page">总览</button>
         <button type="button" data-main-view="manage">管理</button>
         <button type="button" data-main-view="logs">日志</button>
-        <button type="button" data-main-view="settings">通知设置</button>
+        <button type="button" data-main-view="settings">系统与通知设置</button>
       </nav>
 
       <section class="card stack" data-main-view-panel="manage">
@@ -2068,7 +2097,7 @@ const APP_HTML = `<!doctype html>
       <section class="card stack notification-settings" data-main-view-panel="settings">
         <div class="between">
           <div>
-            <h2>通知设置</h2>
+            <h2>系统与通知设置</h2>
             <div class="muted">一个事件会发送到所有已启用渠道。</div>
           </div>
           <div class="row">
@@ -2080,6 +2109,18 @@ const APP_HTML = `<!doctype html>
           <label>
             默认离线阈值
             <input id="defaultFailureThreshold" type="number" min="1" step="1">
+          </label>
+          <label>
+            系统显示时区
+            <select id="systemTimezone">
+              <option value="local">浏览器本地时间</option>
+              <option value="UTC">UTC (格林威治时间)</option>
+              <option value="Asia/Shanghai">Asia/Shanghai (北京时间)</option>
+              <option value="Asia/Hong_Kong">Asia/Hong_Kong (香港时间)</option>
+              <option value="Asia/Tokyo">Asia/Tokyo (东京时间)</option>
+              <option value="America/New_York">America/New_York (美东时间)</option>
+              <option value="Europe/London">Europe/London (伦敦时间)</option>
+            </select>
           </label>
           <label class="row" style="gap: 6px; color: var(--muted);">
             <input class="switch" id="notificationsEnabled" type="checkbox">启用通知
@@ -2186,6 +2227,7 @@ const APP_HTML = `<!doctype html>
     const eventSearch = document.querySelector("#eventSearch");
     const lastRunAt = document.querySelector("#lastRunAt");
     const defaultFailureThreshold = document.querySelector("#defaultFailureThreshold");
+    const systemTimezone = document.querySelector("#systemTimezone");
     const notificationsEnabled = document.querySelector("#notificationsEnabled");
     const notificationOfflinePolicy = document.querySelector("#notificationOfflinePolicy");
     const notificationEvents = document.querySelector("#notificationEvents");
@@ -2204,7 +2246,7 @@ const APP_HTML = `<!doctype html>
       { label: "错误", width: 240, minWidth: 140 }
     ];
 
-    let settings = { defaultFailureThreshold: 2, notifications: defaultNotifications(), panels: [] };
+    let settings = { defaultFailureThreshold: 2, timezone: "local", notifications: defaultNotifications(), panels: [] };
     let state = { lastRunAt: null, vps: {} };
     let selectedPanelId = null;
     let selectedStatusScope = "current";
@@ -2261,6 +2303,10 @@ const APP_HTML = `<!doctype html>
       }
     });
     defaultFailureThreshold.addEventListener("focusout", autoSaveSettings);
+    systemTimezone.addEventListener("change", () => {
+      autoSaveSettings();
+      renderLiveData();
+    });
     notificationsEnabled.addEventListener("change", autoSaveSettings);
     notificationOfflinePolicy.addEventListener("change", autoSaveSettings);
     notificationEvents.addEventListener("change", autoSaveSettings);
@@ -2428,6 +2474,7 @@ const APP_HTML = `<!doctype html>
 
     async function persistSettings({ renderAfterSave, updateLocalSettings }) {
       settings.defaultFailureThreshold = Number(defaultFailureThreshold.value || 2);
+      settings.timezone = systemTimezone.value || "local";
       collectNotificationForm();
       collectPanelForm();
       const savedSettings = await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
@@ -2474,7 +2521,7 @@ const APP_HTML = `<!doctype html>
       try {
         const response = await api("/api/vps/start", { method: "POST", body: JSON.stringify({ panelId, vpsId }) });
         if (response.result?.startSuppressed) {
-          setNotice(mainNotice, "启动防重中，冷却至：" + response.result.startCooldownUntil);
+          setNotice(mainNotice, "启动防重中，冷却至：" + (response.result.startCooldownUntil ? formatDateTime(response.result.startCooldownUntil) : "-"));
         } else {
           setNotice(mainNotice, "已发送启动命令。");
         }
@@ -2719,6 +2766,7 @@ const APP_HTML = `<!doctype html>
 
     function render() {
       defaultFailureThreshold.value = settings.defaultFailureThreshold || 2;
+      systemTimezone.value = settings.timezone || "local";
       settings.notifications = normalizeClientNotifications(settings.notifications);
       renderNotificationSettings();
       renderPanelList();
@@ -2848,11 +2896,13 @@ const APP_HTML = `<!doctype html>
 
     function getLiveVpsDisplay(panel, vps) {
       const row = (state.vps || {})[panel.id + ":" + vps.id];
+      const rawCheckedAt = row?.checkedAt || vps.lastCheckedAt;
+      const formattedCheckedAt = rawCheckedAt && rawCheckedAt !== "-" ? formatDateTime(rawCheckedAt) : "-";
       return {
         ip: row?.ip || vps.ip || "-",
         status: row?.checkedAt ? monitorStatusBadge(row) : statusBadge(vps.status),
         failureCount: row?.checkedAt ? row.failureCount || 0 : vps.failureCount || 0,
-        lastCheckedAt: row?.checkedAt || vps.lastCheckedAt || "-"
+        lastCheckedAt: formattedCheckedAt
       };
     }
 
@@ -2891,7 +2941,7 @@ const APP_HTML = `<!doctype html>
             </div>
           \`).join("")}
         </div>
-        <div class="status-footer">最后更新于 \${escapeHtml(state.lastRunAt || "-")}</div>
+        <div class="status-footer">最后更新于 \${escapeHtml(state.lastRunAt && state.lastRunAt !== "-" ? formatDateTime(state.lastRunAt) : "-")}</div>
       \`;
     }
 
@@ -3065,20 +3115,45 @@ const APP_HTML = `<!doctype html>
       const date = new Date(value);
       if (!Number.isFinite(date.getTime())) return "-";
 
-      const pad = (number) => String(number).padStart(2, "0");
-      return [
-        date.getFullYear(),
-        pad(date.getMonth() + 1),
-        pad(date.getDate())
-      ].join("-") + " " + [
-        pad(date.getHours()),
-        pad(date.getMinutes()),
-        pad(date.getSeconds())
-      ].join(":");
+      const tz = settings.timezone || "local";
+      const options = {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+      };
+      if (tz !== "local") {
+        options.timeZone = tz;
+      }
+
+      try {
+        const formatter = new Intl.DateTimeFormat("zh-CN", options);
+        const parts = formatter.formatToParts(date);
+        const partMap = {};
+        for (const part of parts) {
+          partMap[part.type] = part.value;
+        }
+        return \`\${partMap.year}-\${partMap.month}-\${partMap.day} \${partMap.hour}:\${partMap.minute}:\${partMap.second}\`;
+      } catch (e) {
+        console.error("Format timezone error", tz, e);
+        const pad = (number) => String(number).padStart(2, "0");
+        return [
+          date.getFullYear(),
+          pad(date.getMonth() + 1),
+          pad(date.getDate())
+        ].join("-") + " " + [
+          pad(date.getHours()),
+          pad(date.getMinutes()),
+          pad(date.getSeconds())
+        ].join(":");
+      }
     }
 
     function renderState() {
-      lastRunAt.textContent = state.lastRunAt ? "最后检查：" + state.lastRunAt : "未检查";
+      lastRunAt.textContent = state.lastRunAt ? "最后检查：" + formatDateTime(state.lastRunAt) : "未检查";
       const rows = Object.values(state.vps || {});
       if (!rows.length) {
         stateTable.innerHTML = '<div class="empty">暂无检查结果。</div>';
@@ -3097,7 +3172,7 @@ const APP_HTML = `<!doctype html>
                 <td>\${row.failureCount || 0}</td>
                 <td>\${startStateBadge(row)}</td>
                 <td>\${escapeHtml(row.error || "-")}</td>
-                <td>\${escapeHtml(row.checkedAt || "-")}</td>
+                <td>\${escapeHtml(row.checkedAt && row.checkedAt !== "-" ? formatDateTime(row.checkedAt) : "-")}</td>
               </tr>
             \`).join("")}
           </tbody>
@@ -3293,7 +3368,7 @@ const APP_HTML = `<!doctype html>
           <tbody>
             \${pageRows.map((row) => \`
               <tr>
-                \${eventTextCell(row.at || "-")}
+                \${eventTextCell(row.at && row.at !== "-" ? formatDateTime(row.at) : "-")}
                 <td>\${levelBadge(row.level)}</td>
                 <td>\${eventBadge(row)}</td>
                 \${eventTextCell(row.panelName || row.panelId)}
