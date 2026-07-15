@@ -12,6 +12,7 @@ const VIRTUALIZOR_REQUEST_TIMEOUT_MS = 15000;
 const DEFAULT_SETTINGS = {
   checkIntervalNote: "Worker wakes up every minute; each VPS controls its own cron schedule.",
   defaultFailureThreshold: 2,
+  apiTimeout: 15,
   timezone: "local",
   notifications: {
     enabled: false,
@@ -71,8 +72,10 @@ export default {
       }
 
       if (url.pathname === "/api/panels/test" && request.method === "POST") {
+        const settings = await getSettings(env);
+        const timeoutMs = (settings.apiTimeout || 15) * 1000;
         const panel = normalizePanel(await request.json());
-        const list = await listVirtualizorVps(panel);
+        const list = await listVirtualizorVps(panel, timeoutMs);
         return jsonResponse({ ok: true, vps: list });
       }
 
@@ -97,8 +100,9 @@ export default {
       if (url.pathname === "/api/vps/start" && request.method === "POST") {
         const body = await request.json();
         const settings = await getSettings(env);
+        const timeoutMs = (settings.apiTimeout || 15) * 1000;
         const { panel, vps } = findConfiguredVps(settings, body.panelId, body.vpsId);
-        const result = await startVirtualizorVpsWithCooldown(env, panel, vps, new Date());
+        const result = await startVirtualizorVpsWithCooldown(env, panel, vps, new Date(), timeoutMs);
         return jsonResponse({ ok: true, panelId: panel.id, vpsId: vps.id, result });
       }
 
@@ -194,7 +198,8 @@ async function checkConfiguredVps(env, settings, state, panel, vps, now, options
       return null;
     }
 
-    const info = await getVirtualizorVpsInfo(panel, vps.id);
+    const timeoutMs = (settings.apiTimeout || 15) * 1000;
+    const info = await getVirtualizorVpsInfo(panel, vps.id, timeoutMs);
     result.online = isVpsOnline(info);
     result.status = readVpsStatus(info);
     result.ip = readVpsIp(info);
@@ -210,7 +215,7 @@ async function checkConfiguredVps(env, settings, state, panel, vps, now, options
     } else {
       result.failureCount += 1;
       if (vps.autoStart && result.failureCount >= failureThreshold) {
-        const startAttempt = await startVirtualizorVpsWithCooldown(env, panel, vps, now);
+        const startAttempt = await startVirtualizorVpsWithCooldown(env, panel, vps, now, timeoutMs);
         result.startSuppressed = startAttempt.startSuppressed;
         result.lastStartAttemptAt = startAttempt.lastStartAttemptAt;
         result.startCooldownUntil = startAttempt.startCooldownUntil;
@@ -283,9 +288,10 @@ async function releaseMonitorRunLock(env, owner) {
 
 async function refreshConfiguredVps(settings) {
   const panels = [];
+  const timeoutMs = (settings.apiTimeout || 15) * 1000;
 
   for (const panel of settings.panels) {
-    const remoteVps = await listVirtualizorVps(panel);
+    const remoteVps = await listVirtualizorVps(panel, timeoutMs);
     const existing = new Map(panel.vps.map((item) => [String(item.id), item]));
     const merged = remoteVps.map((item) => ({
       id: String(item.id),
@@ -305,8 +311,8 @@ async function refreshConfiguredVps(settings) {
   return { ...settings, panels };
 }
 
-async function listVirtualizorVps(panel) {
-  const data = await virtualizorRequest(panel, { act: "listvs" });
+async function listVirtualizorVps(panel, timeoutMs) {
+  const data = await virtualizorRequest(panel, { act: "listvs" }, timeoutMs);
   const entries = extractVirtualizorVpsEntries(data);
 
   return entries.map(([, item]) => ({
@@ -376,15 +382,15 @@ function isVirtualizorVpsObject(value, key = "") {
   return hasVpsId && hasVpsShape;
 }
 
-async function getVirtualizorVpsInfo(panel, vpsId) {
-  return virtualizorRequest(panel, { act: "vpsmanage", svs: vpsId });
+async function getVirtualizorVpsInfo(panel, vpsId, timeoutMs) {
+  return virtualizorRequest(panel, { act: "vpsmanage", svs: vpsId }, timeoutMs);
 }
 
-async function startVirtualizorVps(panel, vpsId) {
-  return virtualizorRequest(panel, { act: "start", svs: vpsId, do: "1" });
+async function startVirtualizorVps(panel, vpsId, timeoutMs) {
+  return virtualizorRequest(panel, { act: "start", svs: vpsId, do: "1" }, timeoutMs);
 }
 
-async function startVirtualizorVpsWithCooldown(env, panel, vps, now) {
+async function startVirtualizorVpsWithCooldown(env, panel, vps, now, timeoutMs) {
   const key = `${panel.id}:${vps.id}`;
   const lockKey = `${START_LOCK_KEY_PREFIX}${key}`;
   const cooldownMinutes = positiveInteger(vps.startCooldownMinutes, DEFAULT_START_COOLDOWN_MINUTES);
@@ -406,7 +412,7 @@ async function startVirtualizorVpsWithCooldown(env, panel, vps, now) {
   await putStartLock(env, lockKey, startAttempt, cooldownMinutes);
 
   try {
-    const startResult = await startVirtualizorVps(panel, vps.id);
+    const startResult = await startVirtualizorVps(panel, vps.id, timeoutMs);
     return {
       started: true,
       startSuppressed: false,
@@ -448,7 +454,7 @@ async function clearStartLock(env, key) {
   await env.CONFIG.delete(`${START_LOCK_KEY_PREFIX}${key}`);
 }
 
-async function virtualizorRequest(panel, params) {
+async function virtualizorRequest(panel, params, timeoutMs) {
   const baseUrl = normalizeBaseUrl(panel.baseUrl);
   const url = new URL("/index.php", baseUrl);
 
@@ -460,16 +466,17 @@ async function virtualizorRequest(panel, params) {
   url.searchParams.set("apikey", panel.apiKey);
   url.searchParams.set("apipass", panel.apiPass);
 
+  const finalTimeoutMs = timeoutMs || VIRTUALIZOR_REQUEST_TIMEOUT_MS;
   let response;
   try {
     response = await fetch(url.toString(), {
       method: "GET",
       headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(VIRTUALIZOR_REQUEST_TIMEOUT_MS)
+      signal: AbortSignal.timeout(finalTimeoutMs)
     });
   } catch (error) {
     if (error.name === "TimeoutError" || error.name === "AbortError") {
-      throw new Error(`Virtualizor request timed out after ${VIRTUALIZOR_REQUEST_TIMEOUT_MS / 1000}s`);
+      throw new Error(`Virtualizor request timed out after ${finalTimeoutMs / 1000}s`);
     }
     throw error;
   }
@@ -566,6 +573,7 @@ function normalizeSettings(input) {
   return {
     checkIntervalNote: DEFAULT_SETTINGS.checkIntervalNote,
     defaultFailureThreshold: positiveInteger(input?.defaultFailureThreshold, 2),
+    apiTimeout: positiveInteger(input?.apiTimeout, 15),
     timezone: typeof input?.timezone === "string" ? input.timezone : "local",
     notifications: normalizeNotifications(input?.notifications),
     panels: Array.isArray(input?.panels) ? input.panels.map(normalizePanel) : []
@@ -784,7 +792,8 @@ async function sendNotificationsForEvent(settings, state, event, previous) {
   }
 
   const message = buildNotificationMessage(event, notificationType, settings.timezone);
-  const results = await Promise.all(channels.map((channel) => sendNotificationChannel(channel, message, event)));
+  const timeoutMs = (settings.apiTimeout || 15) * 1000;
+  const results = await Promise.all(channels.map((channel) => sendNotificationChannel(channel, message, event, timeoutMs)));
   updateNotificationState(state, event, notificationType);
   return results;
 }
@@ -893,7 +902,8 @@ async function sendTestNotification(settings, channelId) {
     title: "VPS 通知测试",
     content: ["这是一条测试通知。", `时间：${formatDateTimeWithTimezone(now, settings.timezone)}`].join("\n")
   };
-  const results = await Promise.all(channels.map((channel) => sendNotificationChannel(channel, message, event)));
+  const timeoutMs = (settings.apiTimeout || 15) * 1000;
+  const results = await Promise.all(channels.map((channel) => sendNotificationChannel(channel, message, event, timeoutMs)));
   return { ok: results.every((item) => item.ok), results };
 }
 
@@ -926,10 +936,10 @@ function buildNotificationMessage(event, notificationType, timezone) {
   };
 }
 
-async function sendNotificationChannel(channel, message, event) {
+async function sendNotificationChannel(channel, message, event, timeoutMs) {
   const sentAt = new Date().toISOString();
   try {
-    await sendNotificationRequest(channel, message, event);
+    await sendNotificationRequest(channel, message, event, timeoutMs);
     return notificationResult(channel, true, null, sentAt);
   } catch (error) {
     return notificationResult(channel, false, error.message || String(error), sentAt);
@@ -947,7 +957,7 @@ function notificationResult(channel, ok, error, sentAt) {
   };
 }
 
-async function sendNotificationRequest(channel, message, event) {
+async function sendNotificationRequest(channel, message, event, timeoutMs) {
   const config = channel.config || {};
   if (channel.provider === "serverChan") {
     requireNotificationValue(config.sendKey, "Server 酱 SendKey");
@@ -956,7 +966,7 @@ async function sendNotificationRequest(channel, message, event) {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body
-    });
+    }, timeoutMs);
   }
 
   if (channel.provider === "pushPlus") {
@@ -971,7 +981,7 @@ async function sendNotificationRequest(channel, message, event) {
         topic: config.topic || undefined,
         template: "txt"
       })
-    });
+    }, timeoutMs);
   }
 
   if (channel.provider === "telegram") {
@@ -981,7 +991,7 @@ async function sendNotificationRequest(channel, message, event) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: config.chatId, text: `${message.title}\n\n${message.content}` })
-    });
+    }, timeoutMs);
   }
 
   if (channel.provider === "feishu") {
@@ -999,7 +1009,7 @@ async function sendNotificationRequest(channel, message, event) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
-    });
+    }, timeoutMs);
   }
 
   if (channel.provider === "dingtalk") {
@@ -1014,7 +1024,7 @@ async function sendNotificationRequest(channel, message, event) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ msgtype: "text", text: { content: `${message.title}\n${message.content}` } })
-    });
+    }, timeoutMs);
   }
 
   if (channel.provider === "wecom") {
@@ -1023,7 +1033,7 @@ async function sendNotificationRequest(channel, message, event) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ msgtype: "text", text: { content: `${message.title}\n${message.content}` } })
-    });
+    }, timeoutMs);
   }
 
   requireNotificationValue(config.webhookUrl, "Webhook URL");
@@ -1035,7 +1045,7 @@ async function sendNotificationRequest(channel, message, event) {
       content: message.content,
       event
     })
-  });
+  }, timeoutMs);
 }
 
 function requireNotificationValue(value, label) {
@@ -1044,10 +1054,10 @@ function requireNotificationValue(value, label) {
   }
 }
 
-async function checkedNotificationFetch(url, init) {
+async function checkedNotificationFetch(url, init, timeoutMs) {
   const response = await fetch(url, {
     ...init,
-    signal: AbortSignal.timeout(VIRTUALIZOR_REQUEST_TIMEOUT_MS)
+    signal: AbortSignal.timeout(timeoutMs || VIRTUALIZOR_REQUEST_TIMEOUT_MS)
   });
   const text = await response.text();
   if (!response.ok) {
@@ -2111,6 +2121,10 @@ const APP_HTML = `<!doctype html>
             <input id="defaultFailureThreshold" type="number" min="1" step="1">
           </label>
           <label>
+            接口超时时间 (秒)
+            <input id="apiTimeout" type="number" min="1" step="1">
+          </label>
+          <label>
             系统显示时区
             <select id="systemTimezone">
               <option value="local">浏览器本地时间</option>
@@ -2226,7 +2240,8 @@ const APP_HTML = `<!doctype html>
     const eventPageJumpBtn = document.querySelector("#eventPageJumpBtn");
     const eventSearch = document.querySelector("#eventSearch");
     const lastRunAt = document.querySelector("#lastRunAt");
-    const defaultFailureThreshold = document.querySelector("#defaultFailureThreshold");
+     const defaultFailureThreshold = document.querySelector("#defaultFailureThreshold");
+    const apiTimeout = document.querySelector("#apiTimeout");
     const systemTimezone = document.querySelector("#systemTimezone");
     const notificationsEnabled = document.querySelector("#notificationsEnabled");
     const notificationOfflinePolicy = document.querySelector("#notificationOfflinePolicy");
@@ -2246,7 +2261,7 @@ const APP_HTML = `<!doctype html>
       { label: "错误", width: 240, minWidth: 140 }
     ];
 
-    let settings = { defaultFailureThreshold: 2, timezone: "local", notifications: defaultNotifications(), panels: [] };
+    let settings = { defaultFailureThreshold: 2, apiTimeout: 15, timezone: "local", notifications: defaultNotifications(), panels: [] };
     let state = { lastRunAt: null, vps: {} };
     let selectedPanelId = null;
     let selectedStatusScope = "current";
@@ -2303,6 +2318,7 @@ const APP_HTML = `<!doctype html>
       }
     });
     defaultFailureThreshold.addEventListener("focusout", autoSaveSettings);
+    apiTimeout.addEventListener("focusout", autoSaveSettings);
     systemTimezone.addEventListener("change", () => {
       autoSaveSettings();
       renderLiveData();
@@ -2474,6 +2490,7 @@ const APP_HTML = `<!doctype html>
 
     async function persistSettings({ renderAfterSave, updateLocalSettings }) {
       settings.defaultFailureThreshold = Number(defaultFailureThreshold.value || 2);
+      settings.apiTimeout = Number(apiTimeout.value || 15);
       settings.timezone = systemTimezone.value || "local";
       collectNotificationForm();
       collectPanelForm();
@@ -2766,6 +2783,7 @@ const APP_HTML = `<!doctype html>
 
     function render() {
       defaultFailureThreshold.value = settings.defaultFailureThreshold || 2;
+      apiTimeout.value = settings.apiTimeout || 15;
       systemTimezone.value = settings.timezone || "local";
       settings.notifications = normalizeClientNotifications(settings.notifications);
       renderNotificationSettings();
