@@ -3104,9 +3104,9 @@ const APP_HTML = `<!doctype html>
 
     function getCronIntervalMinutes(cron) {
       const expr = cron || "*/5 * * * *";
-      const parts = expr.trim().split(/\s+/);
+      const parts = expr.trim().split(/\\s+/);
       const minutePart = parts[0] || "";
-      const match = minutePart.match(/^\*\/(\d+)/);
+      const match = minutePart.match(/^\\*\\/(\\d+)/);
       if (match) {
         return parseInt(match[1], 10);
       }
