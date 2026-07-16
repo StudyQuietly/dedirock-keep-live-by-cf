@@ -232,7 +232,9 @@ async function checkConfiguredVps(env, settings, state, panel, vps, now, options
       result.startCooldownUntil = error.startAttempt.startCooldownUntil;
     }
     result.error = error.message || String(error);
-    result.failureCount += 1;
+    if (!error.isTimeout) {
+      result.failureCount += 1;
+    }
   }
 
   return { key, result };
@@ -476,7 +478,9 @@ async function virtualizorRequest(panel, params, timeoutMs) {
     });
   } catch (error) {
     if (error.name === "TimeoutError" || error.name === "AbortError") {
-      throw new Error(`Virtualizor request timed out after ${finalTimeoutMs / 1000}s`);
+      const err = new Error(`Virtualizor request timed out after ${finalTimeoutMs / 1000}s`);
+      err.isTimeout = true;
+      throw err;
     }
     throw error;
   }
