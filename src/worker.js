@@ -14,6 +14,8 @@ const DEFAULT_SETTINGS = {
   defaultFailureThreshold: 2,
   apiTimeout: 15,
   timezone: "local",
+  enableLock: false,
+  stateWriteInterval: 30,
   notifications: {
     enabled: false,
     events: {
@@ -118,27 +120,35 @@ export default {
 };
 
 async function runMonitor(env, options = {}) {
-  const lock = await acquireMonitorRunLock(env);
-  if (!lock.acquired) {
-    return {
-      ok: true,
-      skipped: true,
-      reason: "Monitor is already running",
-      checked: 0,
-      checks: [],
-      activeRun: lock.activeRun
-    };
+  const settings = options.settings || await getSettings(env);
+  const useLock = settings.enableLock ?? false;
+
+  let lock = null;
+  if (useLock) {
+    lock = await acquireMonitorRunLock(env);
+    if (!lock.acquired) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: "Monitor is already running",
+        checked: 0,
+        checks: [],
+        activeRun: lock.activeRun
+      };
+    }
   }
 
   try {
-    return await runMonitorChecks(env, options);
+    return await runMonitorChecks(env, { ...options, settings });
   } finally {
-    await releaseMonitorRunLock(env, lock.owner);
+    if (useLock && lock?.owner) {
+      await releaseMonitorRunLock(env, lock.owner);
+    }
   }
 }
 
 async function runMonitorChecks(env, options = {}) {
-  const settings = await getSettings(env);
+  const settings = options.settings || await getSettings(env);
   const state = await getState(env);
   const now = new Date();
   const jobs = [];
@@ -150,24 +160,47 @@ async function runMonitorChecks(env, options = {}) {
   }
 
   const checks = (await runWithConcurrency(jobs, MONITOR_CONCURRENCY)).filter(Boolean);
+  let stateChanged = false;
+
+  const lastRunAtTime = state.lastRunAt ? new Date(state.lastRunAt).getTime() : 0;
+  const elapsedMinutes = (now.getTime() - lastRunAtTime) / (60 * 1000);
+  const writeInterval = settings.stateWriteInterval !== undefined ? settings.stateWriteInterval : 30;
+  const timeLimitMet = writeInterval > 0 && elapsedMinutes >= writeInterval;
+
   for (const { key, result } of checks) {
     const previous = state.vps[key] || {};
+    
+    const statusChanged = 
+      previous.online !== result.online ||
+      previous.error !== result.error ||
+      previous.failureCount !== result.failureCount ||
+      previous.started !== result.started ||
+      previous.startSuppressed !== result.startSuppressed ||
+      previous.lastStartAttemptAt !== result.lastStartAttemptAt ||
+      previous.startCooldownUntil !== result.startCooldownUntil;
+
     state.vps[key] = result;
-    const event = appendMonitorEvent(state, result);
-    if (event) {
-      const notificationResults = await sendNotificationsForEvent(settings, state, event, previous);
-      if (notificationResults.length) {
-        event.notificationResults = notificationResults;
-        if (notificationResults.some((item) => !item.ok)) {
-          event.important = true;
-          ensureImportantEvent(state, event);
+
+    if (statusChanged || timeLimitMet || options.force || !state.lastRunAt) {
+      stateChanged = true;
+      const event = appendMonitorEvent(state, result);
+      if (event && statusChanged) {
+        const notificationResults = await sendNotificationsForEvent(settings, state, event, previous);
+        if (notificationResults.length) {
+          event.notificationResults = notificationResults;
+          if (notificationResults.some((item) => !item.ok)) {
+            event.important = true;
+            ensureImportantEvent(state, event);
+          }
         }
       }
     }
   }
 
-  state.lastRunAt = now.toISOString();
-  await putJson(env, STATE_KEY, state);
+  if (stateChanged || timeLimitMet || options.force || !state.lastRunAt) {
+    state.lastRunAt = now.toISOString();
+    await putJson(env, STATE_KEY, state);
+  }
 
   return { ok: true, checked: checks.length, checks: checks.map((item) => item.result) };
 }
@@ -579,6 +612,8 @@ function normalizeSettings(input) {
     defaultFailureThreshold: positiveInteger(input?.defaultFailureThreshold, 2),
     apiTimeout: positiveInteger(input?.apiTimeout, 15),
     timezone: typeof input?.timezone === "string" ? input.timezone : "local",
+    enableLock: Boolean(input?.enableLock ?? false),
+    stateWriteInterval: nonNegativeInteger(input?.stateWriteInterval, 30),
     notifications: normalizeNotifications(input?.notifications),
     panels: Array.isArray(input?.panels) ? input.panels.map(normalizePanel) : []
   };
@@ -701,6 +736,11 @@ function normalizeCronExpression(value) {
 function positiveInteger(value, fallback) {
   const number = Number(value);
   return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function nonNegativeInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : fallback;
 }
 
 function findConfiguredVps(settings, panelId, vpsId) {
@@ -2128,6 +2168,13 @@ const APP_HTML = `<!doctype html>
             接口超时时间 (秒)
             <input id="apiTimeout" type="number" min="1" step="1">
           </label>
+          <label class="row" style="gap: 6px; color: var(--muted); margin-top: 10px;">
+            <input class="switch" id="enableLock" type="checkbox">启用运行锁 (防止并发，建议关闭)
+          </label>
+          <label>
+            状态写入间隔 (分钟，0表示仅在变化时写入)
+            <input id="stateWriteInterval" type="number" min="0" step="1">
+          </label>
           <label>
             系统显示时区
             <select id="systemTimezone">
@@ -2246,6 +2293,8 @@ const APP_HTML = `<!doctype html>
     const lastRunAt = document.querySelector("#lastRunAt");
      const defaultFailureThreshold = document.querySelector("#defaultFailureThreshold");
     const apiTimeout = document.querySelector("#apiTimeout");
+    const enableLock = document.querySelector("#enableLock");
+    const stateWriteInterval = document.querySelector("#stateWriteInterval");
     const systemTimezone = document.querySelector("#systemTimezone");
     const notificationsEnabled = document.querySelector("#notificationsEnabled");
     const notificationOfflinePolicy = document.querySelector("#notificationOfflinePolicy");
@@ -2265,7 +2314,7 @@ const APP_HTML = `<!doctype html>
       { label: "错误", width: 240, minWidth: 140 }
     ];
 
-    let settings = { defaultFailureThreshold: 2, apiTimeout: 15, timezone: "local", notifications: defaultNotifications(), panels: [] };
+     let settings = { defaultFailureThreshold: 2, apiTimeout: 15, timezone: "local", enableLock: false, stateWriteInterval: 30, notifications: defaultNotifications(), panels: [] };
     let state = { lastRunAt: null, vps: {} };
     let selectedPanelId = null;
     let selectedStatusScope = "current";
@@ -2323,6 +2372,8 @@ const APP_HTML = `<!doctype html>
     });
     defaultFailureThreshold.addEventListener("focusout", autoSaveSettings);
     apiTimeout.addEventListener("focusout", autoSaveSettings);
+    enableLock.addEventListener("change", autoSaveSettings);
+    stateWriteInterval.addEventListener("focusout", autoSaveSettings);
     systemTimezone.addEventListener("change", () => {
       autoSaveSettings();
       renderLiveData();
@@ -2495,6 +2546,8 @@ const APP_HTML = `<!doctype html>
     async function persistSettings({ renderAfterSave, updateLocalSettings }) {
       settings.defaultFailureThreshold = Number(defaultFailureThreshold.value || 2);
       settings.apiTimeout = Number(apiTimeout.value || 15);
+      settings.enableLock = enableLock.checked;
+      settings.stateWriteInterval = Number(stateWriteInterval.value ?? 30);
       settings.timezone = systemTimezone.value || "local";
       collectNotificationForm();
       collectPanelForm();
@@ -2788,6 +2841,8 @@ const APP_HTML = `<!doctype html>
     function render() {
       defaultFailureThreshold.value = settings.defaultFailureThreshold || 2;
       apiTimeout.value = settings.apiTimeout || 15;
+      enableLock.checked = Boolean(settings.enableLock ?? false);
+      stateWriteInterval.value = settings.stateWriteInterval !== undefined ? settings.stateWriteInterval : 30;
       systemTimezone.value = settings.timezone || "local";
       settings.notifications = normalizeClientNotifications(settings.notifications);
       renderNotificationSettings();
@@ -2986,8 +3041,8 @@ const APP_HTML = `<!doctype html>
       const key = panel.id + ":" + vps.id;
       const row = (state.vps || {})[key];
       const serviceStatus = getServiceStatus(row, vps);
-      const availability = calculateAvailability(key, row, vps);
       const history = buildStatusHistory(key, row, vps);
+      const availability = history.availability;
       const name = vps.name || vps.hostname || vps.id;
 
       return \`
@@ -3047,22 +3102,85 @@ const APP_HTML = `<!doctype html>
       return { level: "down", label: "Offline", badgeClass: "down" };
     }
 
-    function calculateAvailability(key, row, vps) {
-      if (!vps.enabled) return "未启用";
-      const samples = getStatusSamples(key, row, vps).filter((sample) => sample.status !== "unknown");
-      if (!samples.length) return "暂无数据";
-
-      const ok = samples.filter((sample) => sample.status === "ok").length;
-      return Math.round((ok / samples.length) * 100) + "%";
+    function getCronIntervalMinutes(cron) {
+      const expr = cron || "*/5 * * * *";
+      const parts = expr.trim().split(/\s+/);
+      const minutePart = parts[0] || "";
+      const match = minutePart.match(/^\*\/(\d+)/);
+      if (match) {
+        return parseInt(match[1], 10);
+      }
+      if (minutePart === "*") {
+        return 1;
+      }
+      return 5;
     }
 
     function buildStatusHistory(key, row, vps) {
-      const samples = getStatusSamples(key, row, vps).reverse();
-      const padded = Array(Math.max(0, 48 - samples.length)).fill(null).map(() => unknownStatusSample()).concat(samples).slice(-48);
-      const firstKnown = padded.find((sample) => sample.at);
+      if (!vps.enabled) {
+        const segments = Array(48).fill(null).map(() => statusSample("unknown", "未启用", null));
+        return { segments, startLabel: "未启用", availability: "未启用" };
+      }
+
+      const now = new Date();
+      const intervalMinutes = getCronIntervalMinutes(vps.cron);
+      const segmentMs = intervalMinutes * 60 * 1000;
+
+      // 1. Gather all state points
+      const points = [];
+
+      // Add the current row state
+      if (row?.checkedAt) {
+        points.push({
+          time: new Date(row.checkedAt).getTime(),
+          sample: rowStatusSample(row)
+        });
+      }
+
+      // Add all event logs
+      const vpsEvents = getStatusEvents(key);
+      for (const event of vpsEvents) {
+        if (event.at) {
+          points.push({
+            time: new Date(event.at).getTime(),
+            sample: eventStatusSample(event)
+          });
+        }
+      }
+
+      // Sort points descending by time (newest first)
+      points.sort((a, b) => b.time - a.time);
+
+      // Helper to find status at a specific timestamp
+      function getStatusAtTime(t) {
+        const match = points.find(p => p.time <= t);
+        if (match) {
+          return statusSample(match.sample.status, match.sample.label, new Date(t).toISOString());
+        }
+        return unknownStatusSample();
+      }
+
+      // 2. Generate 48 segments representing history ending at now
+      const segments = [];
+      const endTime = now.getTime();
+      for (let i = 0; i < 48; i++) {
+        const segmentTime = endTime - (47 - i) * segmentMs;
+        segments.push(getStatusAtTime(segmentTime));
+      }
+
+      // Find the first segment that is not unknown
+      const firstKnown = segments.find(s => s.status !== "unknown");
       const startLabel = firstKnown?.at ? relativeTime(firstKnown.at) : "暂无";
 
-      return { segments: padded, startLabel };
+      // 3. Calculate availability based on segments
+      const active = segments.filter((s) => s.status !== "unknown");
+      let availability = "暂无数据";
+      if (active.length) {
+        const ok = active.filter((s) => s.status === "ok").length;
+        availability = Math.round((ok / active.length) * 100) + "%";
+      }
+
+      return { segments, startLabel, availability };
     }
 
     function getStatusSamples(key, row, vps) {
